@@ -22,7 +22,6 @@ export class VectorFieldRenderer {
     this.scene = scene;
     this.config = config;
     
-    // Create arrow geometry (cone pointing up)
     this.arrowGeometry = new THREE.ConeGeometry(0.05, 0.2, 8);
     this.arrowMaterial = new THREE.MeshBasicMaterial({ 
       color: 0x00ff00,
@@ -99,9 +98,11 @@ export class VectorFieldRenderer {
       // Calculate arrow properties
       let arrowLength = field.length();
       if (this.config.showDirectionOnly) {
-        arrowLength = 0.2; // Fixed length for direction only
+        arrowLength = 0.3; // Fixed length for direction only
       } else {
-        arrowLength = Math.min(arrowLength / this.config.maxFieldMagnitude, 1) * this.config.arrowScale;
+        // Scale field magnitude more reasonably
+        const normalizedMagnitude = Math.min(arrowLength / this.config.maxFieldMagnitude, 1);
+        arrowLength = Math.max(normalizedMagnitude * this.config.arrowScale, 0.1); // Minimum visible size
       }
 
       // Position
@@ -155,8 +156,8 @@ export function createDefaultVectorFieldConfig(): VectorFieldConfig {
       min: new THREE.Vector3(-5, -5, -5),
       max: new THREE.Vector3(5, 5, 5)
     },
-    arrowScale: 1.0,
-    maxFieldMagnitude: 1e6,
+    arrowScale: 2.0,
+    maxFieldMagnitude: 1e4,
     showDirectionOnly: false
   };
 }

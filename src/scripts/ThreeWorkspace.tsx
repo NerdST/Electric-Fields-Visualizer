@@ -39,14 +39,14 @@ const negativeChargeMaterial = new THREE.MeshStandardMaterial({ color: 0x4444ff 
 
 // Add some default charges
 const charge1 = createDefaultCharge('charge-1');
-charge1.position.set(2, 0, 0);
+charge1.position.set(0, 0, 0);
 charge1.magnitude = 1e-6;
 
-const charge2 = createDefaultCharge('charge-2');
-charge2.position.set(-2, 0, 0);
-charge2.magnitude = -1e-6;
+// const charge2 = createDefaultCharge('charge-2');
+// charge2.position.set(-2, 0, 0);
+// charge2.magnitude = -1e-6;
 
-const charges: Charge[] = [charge1, charge2];
+const charges: Charge[] = [charge1]; //[charge1, charge2];
 
 // Create charge visualizations
 const chargeMeshes: THREE.Mesh[] = [];
@@ -115,9 +115,10 @@ const ThreeWorkspace: React.FC = () => {
   }, []);
 
   const toggleVectorField = () => {
-    setShowVectorField(!showVectorField);
+    const newVisibility = !showVectorField;
+    setShowVectorField(newVisibility);
     if (vectorFieldRenderer) {
-      vectorFieldRenderer.setVisible(!showVectorField);
+      vectorFieldRenderer.setVisible(newVisibility);
     }
   };
 
