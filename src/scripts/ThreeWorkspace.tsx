@@ -115,9 +115,10 @@ const ThreeWorkspace: React.FC = () => {
   }, []);
 
   const toggleVectorField = () => {
-    setShowVectorField(!showVectorField);
+    const newVisibility = !showVectorField;
+    setShowVectorField(newVisibility);
     if (vectorFieldRenderer) {
-      vectorFieldRenderer.setVisible(!showVectorField);
+      vectorFieldRenderer.setVisible(newVisibility);
     }
   };
 
