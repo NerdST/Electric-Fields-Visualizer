@@ -1,0 +1,8 @@
+{
+  "name": "fields-visualizer",
+  "compatibility_date": "2025-10-01",
+  "main": "src/main.tsx",
+  "assets": {
+    "directory": "./dist"
+  }
+}
