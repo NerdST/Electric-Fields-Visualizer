@@ -27,15 +27,15 @@ export function electricFieldFromCharge(
 ): ElectricFieldResult {
   const r = position.clone().sub(charge.position);
   const distance = r.length();
-  
+
   // Apply softening to avoid singularities
   const effectiveDistance = Math.max(distance, PHYSICS_CONSTANTS.SOFTENING_FACTOR);
-  
+
   const fieldMagnitude = (PHYSICS_CONSTANTS.K * charge.magnitude) / (effectiveDistance * effectiveDistance);
   const field = r.normalize().multiplyScalar(fieldMagnitude);
-  
+
   const potential = (PHYSICS_CONSTANTS.K * charge.magnitude) / effectiveDistance;
-  
+
   return { field, potential };
 }
 
@@ -48,13 +48,13 @@ export function electricFieldAt(
 ): ElectricFieldResult {
   const totalField = new THREE.Vector3(0, 0, 0);
   let totalPotential = 0;
-  
+
   for (const charge of charges) {
     const result = electricFieldFromCharge(position, charge);
     totalField.add(result.field);
     totalPotential += result.potential;
   }
-  
+
   return { field: totalField, potential: totalPotential };
 }
 
