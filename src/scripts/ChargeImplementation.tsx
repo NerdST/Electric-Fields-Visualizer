@@ -1,5 +1,325 @@
 // import * as THREE from 'three';
 
+// FDTD simulation of electric fields from point charges using WebGPU
+///////////////////////////////////////////
+const updateAlphaBeta = `
+  @group(0) @binding(0) var materialTex: texture_2d<f32>;
+  @group(0) @binding(1) var materialSampler: sampler;
+
+  struct SimParams {
+    dt: f32,
+    cellSize: f32,
+    _pad0: f32,
+    _pad1: f32,
+  };
+  @group(0) @binding(2) var<uniform> sim: SimParams;
+
+  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(outTex);
+    if (gid.x >= dims.x || gid.y >= dims.y) {
+      return;
+    }
+
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let mat = textureSample(materialTex, materialSampler, uv).rgb;
+    let permeability = mat.x;
+    let permittivity = mat.y;
+    let conductivity = mat.z;
+
+    let cEl = conductivity * sim.dt / (2.0 * permeability);
+    let dEl = 1.0 / (1.0 + cEl);
+    let alphaEl = (1.0 - cEl) * dEl;
+    let betaEl = sim.dt / (permeability * sim.cellSize) * dEl;
+
+    let cMag = conductivity * sim.dt / (2.0 * permittivity);
+    let dMag = 1.0 / (1.0 + cMag);
+    let alphaMag = (1.0 - cMag) * dMag;
+    let betaMag = sim.dt / (permittivity * sim.cellSize) * dMag;
+
+    textureStore(outTex, vec2<i32>(gid.xy), vec4<f32>(alphaEl, betaEl, alphaMag, betaMag));
+  }
+`;
+
+const updateElectric = `
+  @group(0) @binding(0) var electricFieldTex: texture_2d<f32>;
+  @group(0) @binding(1) var magneticFieldTex: texture_2d<f32>;
+  @group(0) @binding(2) var alphaBetaFieldTex: texture_2d<f32>;
+  @group(0) @binding(3) var fieldSampler: sampler;
+
+  struct FieldParams {
+    relativeCellSize: vec2<f32>,
+    reflectiveBoundary: u32,
+    _pad: u32,
+  };
+  @group(0) @binding(4) var<uniform> params: FieldParams;
+
+  @group(0) @binding(5) var outTex: texture_storage_2d<rgba32float, write>;
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(outTex);
+    if (gid.x >= dims.x || gid.y >= dims.y) {
+      return;
+    }
+
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+
+    if (params.reflectiveBoundary == 0u) {
+      let b = 2.0 * params.relativeCellSize;
+      
+      let xAtMinBound = select(0.0, params.relativeCellSize.x, uv.x < b.x);
+      let xAtMaxBound = select(0.0, -params.relativeCellSize.x, uv.x + b.x >= 1.0);
+      let yAtMinBound = select(0.0, params.relativeCellSize.y, uv.y < b.y);
+      let yAtMaxBound = select(0.0, -params.relativeCellSize.y, uv.y + b.y >= 1.0);
+
+      if (xAtMinBound != 0.0 || xAtMaxBound != 0.0 || yAtMinBound != 0.0 || yAtMaxBound != 0.0) {
+        let boundaryUV = uv + vec2<f32>(xAtMinBound + xAtMaxBound, yAtMinBound + yAtMaxBound);
+        let boundaryField = textureSample(electricFieldTex, fieldSampler, boundaryUV);
+        textureStore(outTex, vec2<i32>(gid.xy), boundaryField);
+        return;
+      }
+    }
+
+    let alphaBeta = textureSample(alphaBetaFieldTex, fieldSampler, uv).rg;
+    
+    let el = textureSample(electricFieldTex, fieldSampler, uv).rgb;
+    let mag = textureSample(magneticFieldTex, fieldSampler, uv).rgb;
+    let magXN = textureSample(magneticFieldTex, fieldSampler, uv - vec2<f32>(params.relativeCellSize.x, 0.0)).rgb;
+    let magYN = textureSample(magneticFieldTex, fieldSampler, uv - vec2<f32>(0.0, params.relativeCellSize.y)).rgb;
+
+    let newEl = vec3<f32>(
+      alphaBeta.x * el.x + alphaBeta.y * (mag.z - magYN.z),
+      alphaBeta.x * el.y + alphaBeta.y * (magXN.z - mag.z),
+      alphaBeta.x * el.z + alphaBeta.y * ((mag.y - magXN.y) - (mag.x - magYN.x))
+    );
+
+    textureStore(outTex, vec2<i32>(gid.xy), vec4<f32>(newEl, 0.0));
+  }
+`;
+
+const updateMagnetic = `
+  @group(0) @binding(0) var electricFieldTex: texture_2d<f32>;
+  @group(0) @binding(1) var magneticFieldTex: texture_2d<f32>;
+  @group(0) @binding(2) var alphaBetaFieldTex: texture_2d<f32>;
+  @group(0) @binding(3) var fieldSampler: sampler;
+
+  struct FieldParams {
+    relativeCellSize: vec2<f32>,
+    reflectiveBoundary: u32,
+    _pad: u32,
+  };
+  @group(0) @binding(4) var<uniform> params: FieldParams;
+
+  @group(0) @binding(5) var outTex: texture_storage_2d<rgba32float, write>;
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(outTex);
+    if (gid.x >= dims.x || gid.y >= dims.y) {
+      return;
+    }
+
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+
+    if (params.reflectiveBoundary == 0u) {
+      let b = 2.0 * params.relativeCellSize;
+      
+      let xAtMinBound = select(0.0, params.relativeCellSize.x, uv.x < b.x);
+      let xAtMaxBound = select(0.0, -params.relativeCellSize.x, uv.x + b.x >= 1.0);
+      let yAtMinBound = select(0.0, params.relativeCellSize.y, uv.y < b.y);
+      let yAtMaxBound = select(0.0, -params.relativeCellSize.y, uv.y + b.y >= 1.0);
+
+      if (xAtMinBound != 0.0 || xAtMaxBound != 0.0 || yAtMinBound != 0.0 || yAtMaxBound != 0.0) {
+        let boundaryUV = uv + vec2<f32>(xAtMinBound + xAtMaxBound, yAtMinBound + yAtMaxBound);
+        let boundaryField = textureSample(magneticFieldTex, fieldSampler, boundaryUV);
+        textureStore(outTex, vec2<i32>(gid.xy), boundaryField);
+        return;
+      }
+    }
+
+    let alphaBeta = textureSample(alphaBetaFieldTex, fieldSampler, uv).ba;
+
+    let mag = textureSample(magneticFieldTex, fieldSampler, uv).rgb;
+    let el = textureSample(electricFieldTex, fieldSampler, uv).rgb;
+    let elXP = textureSample(electricFieldTex, fieldSampler, uv + vec2<f32>(params.relativeCellSize.x, 0.0)).rgb;
+    let elYP = textureSample(electricFieldTex, fieldSampler, uv + vec2<f32>(0.0, params.relativeCellSize.y)).rgb;
+
+    let newMag = vec3<f32>(
+      alphaBeta.x * mag.x - alphaBeta.y * (elYP.z - el.z),
+      alphaBeta.x * mag.y - alphaBeta.y * (el.z - elXP.z),
+      alphaBeta.x * mag.z - alphaBeta.y * ((elXP.y - el.y) - (elYP.x - el.x))
+    );
+
+    textureStore(outTex, vec2<i32>(gid.xy), vec4<f32>(newMag, 0.0));
+  }
+`;
+
+///////////////////////////////////////////
+// const pointChargeShader = `
+// @group(0) @binding(0) var<storage, read> charges: array<vec4<f32>>; // xyz: position, w: magnitude
+// @group(0) @binding(1) var<uniform> gridConfig: vec4<f32>; // x: gridSizeX, y: gridSizeY, z: gridSizeZ, w: spacing
+// @group(0) @binding(2) var<storage, read_write> fieldOutput: array<vec4<f32>>; // xyz: field vector, w: potential
+
+// @compute @workgroup_size(64)
+// fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+//     let index = global_id.x;
+//     if (index >= arrayLength(&fieldOutput)) {
+//         return;
+//     }
+
+//     // Calculate actual grid position
+//     let gridSize = u32(gridConfig.x);
+//     let spacing = gridConfig.w;
+//     let x = f32(index % gridSize);
+//     let y = f32(index / gridSize);
+//     let position = vec3<f32>((x - f32(gridSize) * 0.5) * spacing, (y - f32(gridSize) * 0.5) * spacing, 0.0);
+
+//     var totalField = vec3<f32>(0.0, 0.0, 0.0);
+//     var totalPotential = 0.0;
+
+//     for (var i = 0u; i < arrayLength(&charges); i = i + 1u) {
+//         let chargePos = charges[i].xyz;
+//         let chargeMag = charges[i].w;
+//         let r = position - chargePos;
+//         let distance = length(r);
+//         let effectiveDistance = max(distance, 0.1); // Softening factor to avoid singularities
+//         let fieldMagnitude = (8.9875517923e9 * chargeMag) / (effectiveDistance * effectiveDistance);
+//         totalField = totalField + normalize(r) * fieldMagnitude;
+//         totalPotential = totalPotential + (8.9875517923e9 * chargeMag) / effectiveDistance;
+//     }
+
+//     fieldOutput[index] = vec4<f32>(totalField, totalPotential);
+// }`;
+
+const injectSource = `
+  @group(0) @binding(0) var sourceFieldTex: texture_2d<f32>;
+  @group(0) @binding(1) var fieldTex: texture_2d<f32>;
+  @group(0) @binding(2) var fieldSampler: sampler;
+
+  struct SourceParams {
+    dt: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+  };
+  @group(0) @binding(3) var<uniform> params: SourceParams;
+
+  @group(0) @binding(4) var outTex: texture_storage_2d<rgba32float, write>;
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(outTex);
+    if (gid.x >= dims.x || gid.y >= dims.y) {
+      return;
+    }
+
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    
+    let source = textureSample(sourceFieldTex, fieldSampler, uv);
+    let field = textureSample(fieldTex, fieldSampler, uv);
+
+    textureStore(outTex, vec2<i32>(gid.xy), field + params.dt * source);
+  }
+`;
+
+const decaySource = `
+  @group(0) @binding(0) var sourceFieldTex: texture_2d<f32>;
+  @group(0) @binding(1) var fieldSampler: sampler;
+
+  struct DecayParams {
+    dt: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+  };
+  @group(0) @binding(2) var<uniform> params: DecayParams;
+
+  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(outTex);
+    if (gid.x >= dims.x || gid.y >= dims.y) {
+      return;
+    }
+
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    
+    let source = textureSample(sourceFieldTex, fieldSampler, uv);
+    let decayedSource = source * pow(0.1, params.dt);
+
+    textureStore(outTex, vec2<i32>(gid.xy), decayedSource);
+  }
+`;
+
+const drawSquare = `
+  @group(0) @binding(0) var inputTex: texture_2d<f32>;
+  @group(0) @binding(1) var fieldSampler: sampler;
+
+  struct DrawParams {
+    pos: vec2<f32>,
+    size: vec2<f32>,
+    value: vec4<f32>,
+    keep: vec4<f32>,
+  };
+  @group(0) @binding(2) var<uniform> params: DrawParams;
+
+  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(outTex);
+    if (gid.x >= dims.x || gid.y >= dims.y) {
+      return;
+    }
+
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let d = abs(params.pos - uv);
+    let oldValue = textureSample(inputTex, fieldSampler, uv);
+    let within = all(d <= params.size);
+
+    let result = select(oldValue, params.value + params.keep * oldValue, within);
+    textureStore(outTex, vec2<i32>(gid.xy), result);
+  }
+`;
+
+const drawEllipse = `
+  @group(0) @binding(0) var inputTex: texture_2d<f32>;
+  @group(0) @binding(1) var fieldSampler: sampler;
+
+  struct DrawParams {
+    pos: vec2<f32>,
+    radius: vec2<f32>,
+    value: vec4<f32>,
+    keep: vec4<f32>,
+  };
+  @group(0) @binding(2) var<uniform> params: DrawParams;
+
+  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
+
+  @compute @workgroup_size(8, 8, 1)
+  fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(outTex);
+    if (gid.x >= dims.x || gid.y >= dims.y) {
+      return;
+    }
+
+    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let d = (params.pos - uv) / params.radius;
+    let distanceSquared = dot(d, d);
+    let within = distanceSquared <= 1.0;
+    
+    let oldValue = textureSample(inputTex, fieldSampler, uv);
+    let result = select(oldValue, params.value + params.keep * oldValue, within);
+    
+    textureStore(outTex, vec2<i32>(gid.xy), result);
+  }
+`;
+
+// Add the missing point charge shader
 const pointChargeShader = `
 @group(0) @binding(0) var<storage, read> charges: array<vec4<f32>>; // xyz: position, w: magnitude
 @group(0) @binding(1) var<uniform> gridConfig: vec4<f32>; // x: gridSizeX, y: gridSizeY, z: gridSizeZ, w: spacing
@@ -18,7 +338,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let x = f32(index % gridSize);
     let y = f32(index / gridSize);
     let position = vec3<f32>((x - f32(gridSize) * 0.5) * spacing, (y - f32(gridSize) * 0.5) * spacing, 0.0);
-    
+
     var totalField = vec3<f32>(0.0, 0.0, 0.0);
     var totalPotential = 0.0;
 
@@ -36,380 +356,462 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     fieldOutput[index] = vec4<f32>(totalField, totalPotential);
 }`;
 
+// Add field visualization shaders
 const fieldVertShader = `
+struct VertexOutput {
+  @builtin(position) position: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
 @vertex
-fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> @builtin(position) vec4<f32> {
-    var pos = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>(1.0, -1.0),
-        vec2<f32>(-1.0, 1.0),
-        vec2<f32>(-1.0, 1.0),
-        vec2<f32>(1.0, -1.0),
-        vec2<f32>(1.0, 1.0)
-    );
-    return vec4<f32>(pos[vertexIndex], 0.0, 1.0);
-}
-`;
+fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+  var pos = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>( 1.0,  1.0),
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 1.0,  1.0),
+    vec2<f32>(-1.0,  1.0)
+  );
+  
+  var output: VertexOutput;
+  output.position = vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+  output.uv = (pos[vertexIndex] + 1.0) * 0.5;
+  return output;
+}`;
 
 const fieldFragShader = `
-@group(0) @binding(0) var<storage, read> fieldOutput: array<vec4<f32>>;
-@group(0) @binding(1) var<uniform> renderConfig: vec4<f32>; // x: gridSize, y: maxPotential, z: minPotential, w: screenWidth
+@group(0) @binding(0) var fieldTexture: texture_2d<f32>;
+@group(0) @binding(1) var fieldSampler: sampler;
+
+struct RenderConfig {
+  gridSize: f32,
+  maxPotential: f32,
+  minPotential: f32,
+  time: f32,
+};
+@group(0) @binding(2) var<uniform> config: RenderConfig;
 
 @fragment
-fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
-    let gridSize = u32(renderConfig.x);
-    let maxPotential = renderConfig.y;
-    let minPotential = renderConfig.z;
-    let screenWidth = renderConfig.w;
-    
-    // Map fragment coordinates to grid coordinates
-    let screenX = fragCoord.x / screenWidth;
-    let screenY = fragCoord.y / (screenWidth * 0.75); // Adjust for aspect ratio
-    
-    let gridX = u32(screenX * f32(gridSize - 1u));
-    let gridY = u32((1.0 - screenY) * f32(gridSize - 1u)); // Flip Y
-    
-    if (gridX >= gridSize || gridY >= gridSize) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    }
-    
-    let index = gridY * gridSize + gridX;
-    if (index >= arrayLength(&fieldOutput)) {
-        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    }
-    
-    let potential = fieldOutput[index].w;
+fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+  let field = textureSample(fieldTexture, fieldSampler, uv);
+  let electricField = field.xyz;
+  let potential = field.w;
+  
+  // Normalize potential for color mapping
+  let normalizedPotential = (potential - config.minPotential) / (config.maxPotential - config.minPotential);
+  
+  // Color based on electric field magnitude and potential
+  let fieldMagnitude = length(electricField.xy);
+  let normalizedField = clamp(fieldMagnitude / 1000.0, 0.0, 1.0);
+  
+  // Create a color based on potential (blue to red)
+  let r = clamp(normalizedPotential, 0.0, 1.0);
+  let b = clamp(1.0 - normalizedPotential, 0.0, 1.0);
+  let g = normalizedField * 0.5;
+  
+  return vec4<f32>(r, g, b, 1.0);
+}`;
 
-    // Normalize potential relative to zero point
-    let maxAbsPotential = max(abs(maxPotential), abs(minPotential));
-    let normalizedPotential = potential / maxAbsPotential;
-    
-    // Create gradient: red for positive, blue for negative, black for zero
-    var red = 0.0;
-    var green = 0.0;
-    var blue = 0.0;
-    
-    if (normalizedPotential > 0.0) {
-        // Positive potential -> red
-        red = normalizedPotential;
-    } else if (normalizedPotential < 0.0) {
-        // Negative potential -> blue
-        blue = -normalizedPotential;
+// Enhanced FDTD Simulation class
+class FDTDSimulation {
+  private device: GPUDevice;
+  private pipelines: Map<string, GPUComputePipeline> = new Map();
+  private textures: Map<string, GPUTexture> = new Map();
+  private buffers: Map<string, GPUBuffer> = new Map();
+  private sampler!: GPUSampler;
+  private textureSize: number;
+  private dt: number = 0.001;
+  private cellSize: number = 0.01;
+  private time: number = 0;
+
+  constructor(device: GPUDevice, textureSize: number = 512) {
+    this.device = device;
+    this.textureSize = textureSize;
+    this.initializeSampler();
+  }
+
+  private initializeSampler() {
+    this.sampler = this.device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+    });
+  }
+
+  async initializePipelines() {
+    const shaders = {
+      updateAlphaBeta,
+      updateElectric,
+      updateMagnetic,
+      injectSource,
+      decaySource,
+      drawSquare,
+      drawEllipse,
+    };
+
+    for (const [name, shader] of Object.entries(shaders)) {
+      const module = this.device.createShaderModule({ code: shader });
+      const pipeline = this.device.createComputePipeline({
+        layout: 'auto',
+        compute: {
+          module,
+          entryPoint: 'main',
+        },
+      });
+      this.pipelines.set(name, pipeline);
     }
-    // Zero potential stays black (0, 0, 0)
-    
-    return vec4<f32>(red, green, blue, 1.0);
+  }
+
+  initializeTextures() {
+    // Create main field textures (double buffered)
+    this.createTexture('electricField', this.textureSize, this.textureSize);
+    this.createTexture('electricFieldNext', this.textureSize, this.textureSize);
+    this.createTexture('magneticField', this.textureSize, this.textureSize);
+    this.createTexture('magneticFieldNext', this.textureSize, this.textureSize);
+
+    // Create auxiliary textures
+    this.createTexture('alphaBetaField', this.textureSize, this.textureSize);
+    this.createTexture('materialField', this.textureSize, this.textureSize);
+    this.createTexture('sourceField', this.textureSize, this.textureSize);
+
+    // Initialize material properties (vacuum by default)
+    this.initializeMaterialField();
+    this.initializeAlphaBeta();
+  }
+
+  private initializeMaterialField() {
+    // Initialize with vacuum properties
+    const materialData = new Float32Array(this.textureSize * this.textureSize * 4);
+    for (let i = 0; i < materialData.length; i += 4) {
+      materialData[i] = 4.0 * Math.PI * 1e-7; // permeability (μ₀)
+      materialData[i + 1] = 8.854187817e-12; // permittivity (ε₀)  
+      materialData[i + 2] = 0.0; // conductivity (σ)
+      materialData[i + 3] = 0.0; // unused
+    }
+
+    this.device.queue.writeTexture(
+      { texture: this.textures.get('materialField')! },
+      materialData,
+      { bytesPerRow: this.textureSize * 16 },
+      { width: this.textureSize, height: this.textureSize }
+    );
+  }
+
+  private initializeAlphaBeta() {
+    const simParams = new Float32Array([this.dt, this.cellSize, 0, 0]);
+    const simBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(simBuffer, 0, simParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('updateAlphaBeta')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('materialField')!.createView() },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: simBuffer } },
+        { binding: 3, resource: this.textures.get('alphaBetaField')!.createView() },
+      ],
+    });
+
+    this.runComputePass('updateAlphaBeta', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+  }
+
+  createTexture(name: string, width: number, height: number, format: GPUTextureFormat = 'rgba32float') {
+    const texture = this.device.createTexture({
+      size: [width, height],
+      format,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.textures.set(name, texture);
+    return texture;
+  }
+
+  createBuffer(name: string, size: number, usage: GPUBufferUsageFlags) {
+    const buffer = this.device.createBuffer({ size, usage });
+    this.buffers.set(name, buffer);
+    return buffer;
+  }
+
+  // Add a point charge source - Fixed to avoid circular reference
+  addPointCharge(x: number, y: number, charge: number) {
+    const nx = (x + 1) * 0.5; // Convert from [-1,1] to [0,1]
+    const ny = (y + 1) * 0.5;
+
+    const drawParams = new Float32Array([
+      nx, ny, // position in [0,1] space
+      0.02, 0.02, // radius
+      0, 0, charge * 1e3, 0, // value (electric field source) - reduced scaling
+      0, 0, 0, 0, // keep (don't keep old values for sources)
+    ]);
+
+    const paramsBuffer = this.device.createBuffer({
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, drawParams);
+
+    // Create temporary texture for drawing
+    const tempTexture = this.device.createTexture({
+      size: [this.textureSize, this.textureSize],
+      format: 'rgba32float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+    });
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('drawEllipse')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('sourceField')!.createView() },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+        { binding: 3, resource: tempTexture.createView() },
+      ],
+    });
+
+    this.runComputePass('drawEllipse', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    // Copy result back to source field
+    this.copyTexture(tempTexture, this.textures.get('sourceField')!);
+    tempTexture.destroy();
+  }
+
+  private copyTexture(source: GPUTexture, destination: GPUTexture) {
+    const commandEncoder = this.device.createCommandEncoder();
+    commandEncoder.copyTextureToTexture(
+      { texture: source },
+      { texture: destination },
+      [this.textureSize, this.textureSize]
+    );
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  // Main simulation step
+  step() {
+    this.time += this.dt;
+
+    // Update electric field
+    this.updateElectricField();
+
+    // Update magnetic field  
+    this.updateMagneticField();
+
+    // Inject sources
+    this.injectSources();
+
+    // Decay sources
+    this.decaySources();
+
+    // Swap buffers
+    this.swapBuffers();
+  }
+
+  private updateElectricField() {
+    const fieldParams = new Float32Array([
+      1.0 / this.textureSize, 1.0 / this.textureSize, // relativeCellSize
+      0, 0, // reflectiveBoundary = false, padding
+    ]);
+
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, fieldParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('updateElectric')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('electricField')!.createView() },
+        { binding: 1, resource: this.textures.get('magneticField')!.createView() },
+        { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
+        { binding: 3, resource: this.sampler },
+        { binding: 4, resource: { buffer: paramsBuffer } },
+        { binding: 5, resource: this.textures.get('electricFieldNext')!.createView() },
+      ],
+    });
+
+    this.runComputePass('updateElectric', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+  }
+
+  private updateMagneticField() {
+    const fieldParams = new Float32Array([
+      1.0 / this.textureSize, 1.0 / this.textureSize, // relativeCellSize
+      0, 0, // reflectiveBoundary = false, padding
+    ]);
+
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, fieldParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('updateMagnetic')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('electricField')!.createView() },
+        { binding: 1, resource: this.textures.get('magneticField')!.createView() },
+        { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
+        { binding: 3, resource: this.sampler },
+        { binding: 4, resource: { buffer: paramsBuffer } },
+        { binding: 5, resource: this.textures.get('magneticFieldNext')!.createView() },
+      ],
+    });
+
+    this.runComputePass('updateMagnetic', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+  }
+
+  private injectSources() {
+    const sourceParams = new Float32Array([this.dt, 0, 0, 0]);
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, sourceParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('injectSource')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('sourceField')!.createView() },
+        { binding: 1, resource: this.textures.get('electricFieldNext')!.createView() },
+        { binding: 2, resource: this.sampler },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+        { binding: 4, resource: this.textures.get('electricFieldNext')!.createView() },
+      ],
+    });
+
+    this.runComputePass('injectSource', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+  }
+
+  private decaySources() {
+    const decayParams = new Float32Array([this.dt, 0, 0, 0]);
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, decayParams);
+
+    // Create temporary texture for decay operation
+    const tempTexture = this.device.createTexture({
+      size: [this.textureSize, this.textureSize],
+      format: 'rgba32float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+    });
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('decaySource')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('sourceField')!.createView() },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+        { binding: 3, resource: tempTexture.createView() },
+      ],
+    });
+
+    this.runComputePass('decaySource', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    // Copy result back
+    this.copyTexture(tempTexture, this.textures.get('sourceField')!);
+    tempTexture.destroy();
+  }
+
+  private swapBuffers() {
+    // Swap electric field buffers
+    const tempE = this.textures.get('electricField');
+    this.textures.set('electricField', this.textures.get('electricFieldNext')!);
+    this.textures.set('electricFieldNext', tempE!);
+
+    // Swap magnetic field buffers
+    const tempM = this.textures.get('magneticField');
+    this.textures.set('magneticField', this.textures.get('magneticFieldNext')!);
+    this.textures.set('magneticFieldNext', tempM!);
+  }
+
+  runComputePass(pipelineName: string, bindGroup: GPUBindGroup, workgroupsX: number, workgroupsY: number = 1, workgroupsZ: number = 1) {
+    const pipeline = this.pipelines.get(pipelineName);
+    if (!pipeline) throw new Error(`Pipeline ${pipelineName} not found`);
+
+    const commandEncoder = this.device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
+
+    computePass.setPipeline(pipeline);
+    computePass.setBindGroup(0, bindGroup);
+    computePass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
+    computePass.end();
+
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  getSampler() {
+    return this.sampler;
+  }
+
+  getTexture(name: string) {
+    return this.textures.get(name);
+  }
+
+  getBuffer(name: string) {
+    return this.buffers.get(name);
+  }
+
+  getPipeline(name: string) {
+    return this.pipelines.get(name);
+  }
+
+  getTime() {
+    return this.time;
+  }
+
+  // Add cleanup method
+  destroy() {
+    for (const texture of this.textures.values()) {
+      texture.destroy();
+    }
+    for (const buffer of this.buffers.values()) {
+      buffer.destroy();
+    }
+  }
 }
-`;
 
-// Initialize WebGPU
-if (!navigator.gpu) {
-  throw new Error("WebGPU not supported on this browser.");
-}
-
-const adapter = await navigator.gpu.requestAdapter();
-if (!adapter) throw new Error("Failed to get GPU adapter");
-
-const device = await adapter.requestDevice();
-if (!device) throw new Error("Failed to get GPU device");
-
-const module = device.createShaderModule({ code: pointChargeShader });
-
-const pipeline = device.createComputePipeline({
-  label: 'Point Charge Electric Field Pipeline',
-  layout: 'auto',
-  compute: {
-    module,
-    entryPoint: 'main',
-  },
-})
-
-// Grid configuration
-const gridSize = 100; // Increased for better resolution
-const spacing = 0.1;
-
-// Create buffers for GPU computation
-const createBuffers = () => {
-  const chargesData = new Float32Array([
-    -1, 0, 0, 1e-9,  // charge at (-1,0,0) with magnitude 1 nanocoulomb
-    1, 0, 0, -1e-9,  // charge at (1,0,0) with magnitude -1 nanocoulomb
-  ]);
-
-  const chargesBuffer = device.createBuffer({
-    size: Math.max(chargesData.byteLength, 16),
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(chargesBuffer, 0, chargesData);
-
-  const gridConfigData = new Float32Array([gridSize, gridSize, 1, spacing]);
-  const gridConfigBuffer = device.createBuffer({
-    size: 16,
-    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(gridConfigBuffer, 0, gridConfigData);
-
-  const fieldOutputBuffer = device.createBuffer({
-    size: gridSize * gridSize * 4 * 4, // vec4<f32>
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: chargesBuffer } },
-      { binding: 1, resource: { buffer: gridConfigBuffer } },
-      { binding: 2, resource: { buffer: fieldOutputBuffer } },
-    ],
-  });
-
-  return { chargesBuffer, gridConfigBuffer, fieldOutputBuffer, bindGroup };
-};
-
-// Get screen dimensions
-const getScreenDimensions = () => {
-  return {
-    width: window.innerWidth,
-    height: window.innerHeight
-  };
-};
-
-// Create fullscreen canvas
-const canvas = document.createElement('canvas');
-const { width, height } = getScreenDimensions();
-canvas.width = width;
-canvas.height = height;
-canvas.style.position = 'fixed';
-canvas.style.top = '0';
-canvas.style.left = '0';
-canvas.style.width = '100vw';
-canvas.style.height = '100vh';
-canvas.style.zIndex = '1';
-canvas.style.cursor = 'crosshair';
-document.body.appendChild(canvas);
-
-// Text display for potential value
-const textDiv = document.createElement('div');
-textDiv.style.position = 'fixed';
-textDiv.style.top = '10px';
-textDiv.style.left = '10px';
-textDiv.style.color = 'white';
-textDiv.style.fontFamily = 'monospace';
-textDiv.style.fontSize = '16px';
-textDiv.style.background = 'rgba(0,0,0,0.8)';
-textDiv.style.padding = '15px';
-textDiv.style.borderRadius = '8px';
-textDiv.style.zIndex = '1000';
-textDiv.style.border = '1px solid rgba(255,255,255,0.3)';
-textDiv.style.backdropFilter = 'blur(10px)';
-textDiv.style.display = 'none';
-document.body.appendChild(textDiv);
-
-// FPS Counter
-const fpsDiv = document.createElement('div');
-fpsDiv.style.position = 'fixed';
-fpsDiv.style.top = '10px';
-fpsDiv.style.right = '10px';
-fpsDiv.style.color = '#00ff88';
-fpsDiv.style.fontFamily = 'monospace';
-fpsDiv.style.fontSize = '14px';
-fpsDiv.style.fontWeight = 'bold';
-fpsDiv.style.background = 'rgba(0,0,0,0.8)';
-fpsDiv.style.padding = '10px';
-fpsDiv.style.borderRadius = '8px';
-fpsDiv.style.zIndex = '1000';
-fpsDiv.style.border = '1px solid rgba(0,255,136,0.3)';
-fpsDiv.style.backdropFilter = 'blur(10px)';
-fpsDiv.style.minWidth = '120px';
-fpsDiv.style.textAlign = 'center';
-fpsDiv.innerHTML = 'FPS: --';
-document.body.appendChild(fpsDiv);
-
-// Performance monitoring
-class PerformanceMonitor {
-  private frameCount = 0;
-  private lastTime = 0;
-  private fps = 0;
-  private frameTime = 0;
-  private frameTimes: number[] = [];
-  private maxSamples = 60;
-
-  update(currentTime: number) {
-    if (this.lastTime === 0) {
-      this.lastTime = currentTime;
-      return;
-    }
-
-    // Calculate frame time
-    this.frameTime = currentTime - this.lastTime;
-    this.frameTimes.push(this.frameTime);
-
-    // Keep only recent samples
-    if (this.frameTimes.length > this.maxSamples) {
-      this.frameTimes.shift();
-    }
-
-    this.frameCount++;
-    this.lastTime = currentTime;
-
-    // Update FPS every 10 frames for stability
-    if (this.frameCount % 10 === 0) {
-      const avgFrameTime = this.frameTimes.reduce((sum, time) => sum + time, 0) / this.frameTimes.length;
-      this.fps = Math.round(1000 / avgFrameTime);
-
-      // Calculate min/max frame times for additional info
-      const minFrameTime = Math.min(...this.frameTimes);
-      const maxFrameTime = Math.max(...this.frameTimes);
-      const minFps = Math.round(1000 / maxFrameTime);
-      const maxFps = Math.round(1000 / minFrameTime);
-
-      this.updateDisplay(avgFrameTime, minFps, maxFps);
-    }
+// Setup render pipeline for FDTD - Fixed device access issue
+const setupFDTDRenderPipeline = async (fdtdSim: FDTDSimulation, gpuDevice: GPUDevice) => {
+  // Get or create the canvas element
+  let canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement | null;
+  if (!canvas) {
+    canvas = document.createElement('canvas');
+    canvas.id = 'fdtd-canvas';
+    canvas.width = 512;
+    canvas.height = 512;
+    canvas.style.display = 'block';
+    canvas.style.border = '1px solid #ccc';
+    document.body.appendChild(canvas);
   }
 
-  private updateDisplay(avgFrameTime: number, minFps: number, maxFps: number) {
-    const fpsColor = this.fps >= 55 ? '#00ff88' : this.fps >= 30 ? '#ffaa00' : '#ff4444';
-
-    fpsDiv.innerHTML = `
-      <div style="color: ${fpsColor}; font-size: 16px; margin-bottom: 4px;">
-        FPS: ${this.fps}
-      </div>
-      <div style="font-size: 11px; color: #aaa;">
-        Frame: ${avgFrameTime.toFixed(1)}ms
-      </div>
-      <div style="font-size: 10px; color: #666;">
-        Range: ${minFps}-${maxFps}
-      </div>
-    `;
-  }
-
-  getFPS() {
-    return this.fps;
-  }
-
-  getFrameTime() {
-    return this.frameTime;
-  }
-}
-
-const performanceMonitor = new PerformanceMonitor();
-
-// GPU computation and field data
-const { chargesBuffer, gridConfigBuffer, fieldOutputBuffer, bindGroup } = createBuffers();
-let fieldData: Float32Array;
-
-// Compute field values
-const computeField = async () => {
-  const commandEncoder = device.createCommandEncoder();
-  const computePass = commandEncoder.beginComputePass();
-  computePass.setPipeline(pipeline);
-  computePass.setBindGroup(0, bindGroup);
-  computePass.dispatchWorkgroups(Math.ceil((gridSize * gridSize) / 64));
-  computePass.end();
-
-  const readBuffer = device.createBuffer({
-    size: fieldOutputBuffer.size,
-    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-  });
-
-  commandEncoder.copyBufferToBuffer(fieldOutputBuffer, 0, readBuffer, 0, fieldOutputBuffer.size);
-  device.queue.submit([commandEncoder.finish()]);
-
-  await readBuffer.mapAsync(GPUMapMode.READ);
-  const arrayBuffer = readBuffer.getMappedRange();
-  fieldData = new Float32Array(arrayBuffer.slice(0));
-  readBuffer.unmap();
-
-  console.log('Field computation complete. Field data length:', fieldData.length);
-};
-
-// Get potential at screen coordinates
-const getPotentialAtScreenPoint = (screenX: number, screenY: number) => {
-  if (!fieldData) return 0;
-
-  // Convert screen coordinates to grid coordinates
-  const normalizedX = screenX / canvas.width;
-  const normalizedY = 1.0 - (screenY / canvas.height); // Flip Y
-
-  const gridX = Math.round(normalizedX * (gridSize - 1));
-  const gridY = Math.round(normalizedY * (gridSize - 1));
-
-  if (gridX < 0 || gridX >= gridSize || gridY < 0 || gridY >= gridSize) return 0;
-
-  const index = gridY * gridSize + gridX;
-  if (index * 4 + 3 >= fieldData.length) return 0;
-
-  return fieldData[index * 4 + 3] || 0;
-};
-
-// Convert screen coordinates to world coordinates
-const screenToWorld = (screenX: number, screenY: number) => {
-  const normalizedX = (screenX / canvas.width) * 2 - 1; // [-1, 1]
-  const normalizedY = 1 - (screenY / canvas.height) * 2; // [1, -1] (flipped)
-
-  // Map to world coordinates (-5 to 5 range)
-  const worldX = normalizedX * 5;
-  const worldY = normalizedY * 5;
-
-  return { x: worldX, y: worldY };
-};
-
-// Mouse interaction
-const onMouseMove = (event: MouseEvent) => {
-  const rect = canvas.getBoundingClientRect();
-  const screenX = event.clientX - rect.left;
-  const screenY = event.clientY - rect.top;
-
-  const worldPos = screenToWorld(screenX, screenY);
-  const potential = getPotentialAtScreenPoint(screenX, screenY);
-  const fps = performanceMonitor.getFPS();
-  const frameTime = performanceMonitor.getFrameTime();
-
-  textDiv.innerHTML = `
-    <div style="margin-bottom: 8px; font-weight: bold; color: #00ff88;">Electric Field Visualizer</div>
-    <div>Position: (${worldPos.x.toFixed(2)}, ${worldPos.y.toFixed(2)})</div>
-    <div>Potential: ${potential.toFixed(6)} V</div>
-    <div style="margin-top: 8px; font-size: 12px; color: #aaa;">
-      Red = High Potential | Blue = Low Potential
-    </div>
-    <div style="margin-top: 8px; font-size: 11px; color: #666; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 6px;">
-      Performance: ${fps} FPS (${frameTime.toFixed(1)}ms)
-    </div>
-  `;
-  textDiv.style.display = 'block';
-};
-
-const onMouseLeave = () => {
-  textDiv.style.display = 'none';
-};
-
-canvas.addEventListener('mousemove', onMouseMove);
-canvas.addEventListener('mouseleave', onMouseLeave);
-
-// WebGPU rendering setup
-let renderPipeline: GPURenderPipeline;
-let renderBindGroup: GPUBindGroup;
-let renderConfigBuffer: GPUBuffer;
-let renderContext: GPUCanvasContext;
-
-const setupRenderPipeline = async () => {
   const context = canvas.getContext('webgpu');
   if (!context) throw new Error('WebGPU context not available');
 
   const format = navigator.gpu.getPreferredCanvasFormat();
   context.configure({
-    device,
+    device: gpuDevice,
     format,
   });
 
-  const vertexModule = device.createShaderModule({
+  const vertexModule = gpuDevice.createShaderModule({
     code: fieldVertShader
   });
 
-  const fragmentModule = device.createShaderModule({
+  const fragmentModule = gpuDevice.createShaderModule({
     code: fieldFragShader
   });
 
-  renderPipeline = device.createRenderPipeline({
+  renderPipeline = gpuDevice.createRenderPipeline({
     layout: 'auto',
     vertex: {
       module: vertexModule,
@@ -425,7 +827,7 @@ const setupRenderPipeline = async () => {
     },
   });
 
-  renderConfigBuffer = device.createBuffer({
+  renderConfigBuffer = gpuDevice.createBuffer({
     size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
@@ -433,95 +835,49 @@ const setupRenderPipeline = async () => {
   return context;
 };
 
-// Update render function
-const updateRender = (context: GPUCanvasContext) => {
-  if (!fieldData || !renderPipeline) return;
+// Updated initialization - Fixed device scope and error handling
+const initialize = async () => {
+  try {
+    console.log('Initializing WebGPU with FDTD...');
+    const { device: gpuDevice, fdtdSim } = await initializeWebGPUWithFDTD();
+    device = gpuDevice; // Set global device reference
+    fdtdSimulation = fdtdSim;
 
-  const renderStart = performance.now();
+    console.log('WebGPU and FDTD initialized successfully');
 
-  const { width } = getScreenDimensions();
+    // Setup render pipeline for FDTD - pass device explicitly
+    renderContext = await setupFDTDRenderPipeline(fdtdSimulation, device);
 
-  // Calculate min/max potential for normalization
-  let minPotential = Infinity;
-  let maxPotential = -Infinity;
+    console.log('FDTD simulation ready. Starting render loop...');
+    animate();
 
-  for (let i = 3; i < fieldData.length; i += 4) {
-    const potential = fieldData[i];
-    if (isFinite(potential)) {
-      minPotential = Math.min(minPotential, potential);
-      maxPotential = Math.max(maxPotential, potential);
-    }
-  }
-
-  // Update render config
-  const renderConfigData = new Float32Array([gridSize, maxPotential, minPotential, width]);
-  device.queue.writeBuffer(renderConfigBuffer, 0, renderConfigData);
-
-  // Create bind group
-  renderBindGroup = device.createBindGroup({
-    layout: renderPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: { buffer: fieldOutputBuffer } },
-      { binding: 1, resource: { buffer: renderConfigBuffer } },
-    ],
-  });
-
-  // Render
-  const commandEncoder = device.createCommandEncoder();
-  const renderPass = commandEncoder.beginRenderPass({
-    colorAttachments: [{
-      view: context.getCurrentTexture().createView(),
-      clearValue: { r: 0, g: 0, b: 0, a: 1 },
-      loadOp: 'clear',
-      storeOp: 'store',
-    }],
-  });
-
-  renderPass.setPipeline(renderPipeline);
-  renderPass.setBindGroup(0, renderBindGroup);
-  renderPass.draw(6);
-  renderPass.end();
-
-  device.queue.submit([commandEncoder.finish()]);
-
-  const renderEnd = performance.now();
-  const renderTime = renderEnd - renderStart;
-
-  // Optional: Log render times for debugging
-  if (performanceMonitor.getFPS() < 30) {
-    console.log(`Slow frame detected: ${renderTime.toFixed(2)}ms render time`);
+  } catch (error) {
+    console.error('Error initializing:', error);
+    // Create error display
+    const errorDiv = document.createElement('div');
+    errorDiv.innerHTML = `<h3>WebGPU Error:</h3><p>${error}</p>`;
+    errorDiv.style.color = 'red';
+    errorDiv.style.padding = '20px';
+    document.body.appendChild(errorDiv);
   }
 };
 
-// Handle window resize
-const handleResize = () => {
-  const { width, height } = getScreenDimensions();
-  canvas.width = width;
-  canvas.height = height;
-};
-
-window.addEventListener('resize', handleResize);
-
-// Animation loop with performance monitoring
+// Add error handling to animation loop
 const animate = (currentTime: number = performance.now()) => {
-  requestAnimationFrame(animate);
+  try {
+    requestAnimationFrame(animate);
 
-  // Update performance monitor
-  performanceMonitor.update(currentTime);
+    if (fdtdSimulation && renderContext && device) {
+      // Run FDTD simulation step
+      fdtdSimulation.step();
 
-  if (renderContext && fieldData) {
-    updateRender(renderContext);
+      // Render the results
+      updateFDTDRender(renderContext, fdtdSimulation);
+    }
+  } catch (error) {
+    console.error('Animation error:', error);
   }
 };
-
-// Initialize with performance logging
-computeField().then(async () => {
-  console.log('Field computation complete. Starting render loop...');
-  renderContext = await setupRenderPipeline();
-  animate();
-}).catch(error => {
-  console.error('Error computing field:', error);
-});
 
 const ChargeCanvas = () => {
   return <div style={{ margin: 0, padding: 0, overflow: 'hidden' }} />;
