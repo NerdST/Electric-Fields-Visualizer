@@ -89,30 +89,25 @@ export class VectorFieldRenderer {
       const fieldResult = electricFieldAt(point, this.charges);
       const field = fieldResult.field;
 
-      // Skip if field is too small
       if (field.length() < 1e-6) {
         matrix.makeScale(0, 0, 0);
         this.arrowMesh.setMatrixAt(i, matrix);
         continue;
       }
 
-      // Calculate arrow properties
       let arrowLength = field.length();
       if (this.config.showDirectionOnly) {
-        arrowLength = 0.3; // Fixed length for direction only
+        arrowLength = 0.3; 
       } else {
-        // Scale field magnitude more reasonably
+        // CHANGE: Scale field magnitude more reasonably
         const normalizedMagnitude = Math.min(arrowLength / this.config.maxFieldMagnitude, 1);
-        arrowLength = Math.max(normalizedMagnitude * this.config.arrowScale, 0.1); // Minimum visible size
+        arrowLength = Math.max(normalizedMagnitude * this.config.arrowScale, 0.1); // Minimize visible size
       }
 
-      // Position
       position.copy(point);
       
-      // Scale (length along Y axis)
       scale.set(1, arrowLength, 1);
       
-      // Rotation to align with field direction
       const direction = field.clone().normalize();
       quaternion.setFromUnitVectors(this.upVector, direction);
 
@@ -133,7 +128,7 @@ export class VectorFieldRenderer {
     const oldGridPoints = this.gridPoints;
     const oldCount = oldGridPoints.length;
     this.config = nextConfig;
-    // Recompute grid points and only recreate mesh if instance count changed
+  
     this.gridPoints = this.generateGridPoints();
     const newCount = this.gridPoints.length;
     if (newCount !== oldCount || !this.arrowMesh) {
