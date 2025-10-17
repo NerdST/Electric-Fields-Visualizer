@@ -1,8 +1,8 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
-import { createDefaultCharge } from '../physics/Charge';
+import { createDefaultCharge, createCharge } from '../physics/Charge';
 import type { Charge } from '../physics/Charge';
 import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../visualization/VectorField';
 
@@ -46,18 +46,67 @@ charge1.magnitude = 1e-6;
 // charge2.position.set(-2, 0, 0);
 // charge2.magnitude = -1e-6;
 
-const charges: Charge[] = [charge1]; //[charge1, charge2];
+let charges: Charge[] = [charge1]; //[charge1, charge2];
 
 // Create charge visualizations
-const chargeMeshes: THREE.Mesh[] = [];
-charges.forEach((charge) => {
-  const material = charge.magnitude > 0 ? positiveChargeMaterial : negativeChargeMaterial;
-  const mesh = new THREE.Mesh(chargeGeometry, material);
-  mesh.position.copy(charge.position);
-  mesh.userData = { chargeId: charge.id };
-  scene.add(mesh);
-  chargeMeshes.push(mesh);
-});
+let chargeMeshes: Map<string, THREE.Mesh> = new Map();
+let selectedChargeId: string | null = null;
+let raycaster = new THREE.Raycaster();
+let mouse = new THREE.Vector2();
+
+// Function to update charge meshes (diff-based: create/update/remove)
+const updateChargeMeshes = () => {
+  const seen: Set<string> = new Set();
+
+  // Update existing and create missing
+  for (const charge of charges) {
+    seen.add(charge.id);
+    let mesh = chargeMeshes.get(charge.id);
+    const desiredMaterial = charge.magnitude > 0 ? positiveChargeMaterial : negativeChargeMaterial;
+    if (!mesh) {
+      mesh = new THREE.Mesh(chargeGeometry, desiredMaterial);
+      mesh.userData = { chargeId: charge.id };
+      scene.add(mesh);
+      chargeMeshes.set(charge.id, mesh);
+    } else {
+      // If sign changed, swap material
+      const isPositive = mesh.material === positiveChargeMaterial;
+      if ((isPositive && charge.magnitude < 0) || (!isPositive && charge.magnitude > 0)) {
+        mesh.material = desiredMaterial;
+      }
+    }
+    mesh.position.copy(charge.position);
+
+    // Selection highlight
+    mesh.scale.setScalar(selectedChargeId === charge.id ? 1.5 : 1.0);
+    // Remove any existing outline
+    mesh.children
+      .filter(c => (c as any).isMesh)
+      .forEach(child => mesh && mesh.remove(child));
+    if (selectedChargeId === charge.id) {
+      const outlineGeometry = new THREE.SphereGeometry(0.25, 16, 16);
+      const outlineMaterial = new THREE.MeshBasicMaterial({ 
+        color: 0xffff00, 
+        wireframe: true,
+        transparent: true,
+        opacity: 0.8
+      });
+      const outline = new THREE.Mesh(outlineGeometry, outlineMaterial);
+      mesh.add(outline);
+    }
+  }
+
+  // Remove meshes that no longer have charges
+  for (const [id, mesh] of Array.from(chargeMeshes.entries())) {
+    if (!seen.has(id)) {
+      scene.remove(mesh);
+      chargeMeshes.delete(id);
+    }
+  }
+};
+
+// Initialize charge meshes
+updateChargeMeshes();
 
 function animate() {
   requestAnimationFrame(animate);
@@ -69,6 +118,119 @@ const ThreeWorkspace: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [vectorFieldRenderer, setVectorFieldRenderer] = useState<VectorFieldRenderer | null>(null);
   const [showVectorField, setShowVectorField] = useState(true);
+  const [chargesState, setChargesState] = useState<Charge[]>(charges);
+  const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
+  const [chargeStack, setChargeStack] = useState<string[]>([]);
+
+  const vfUpdateScheduled = useRef(false);
+  const scheduleVectorFieldUpdate = useCallback((nextCharges: Charge[]) => {
+    if (!vectorFieldRenderer) return;
+    if (vfUpdateScheduled.current) return;
+    vfUpdateScheduled.current = true;
+    requestAnimationFrame(() => {
+      vfUpdateScheduled.current = false;
+      vectorFieldRenderer.updateCharges(nextCharges);
+    });
+  }, [vectorFieldRenderer]);
+
+  // Charge management functions
+  const addCharge = useCallback(() => {
+    const newCharge = createCharge(
+      new THREE.Vector3(
+        (Math.random() - 0.5) * 10,
+        (Math.random() - 0.5) * 10,
+        (Math.random() - 0.5) * 10
+      ),
+      Math.random() > 0.5 ? 1e-6 : -1e-6,
+      `charge-${Date.now()}`
+    );
+    
+    const newCharges = [...chargesState, newCharge];
+    charges = newCharges;
+    setChargesState(newCharges);
+    setChargeStack(prev => [...prev, newCharge.id]);
+    updateChargeMeshes();
+    scheduleVectorFieldUpdate(newCharges);
+  }, [chargesState, vectorFieldRenderer]);
+
+  const removeCharge = useCallback((chargeId: string) => {
+    const newCharges = chargesState.filter(charge => charge.id !== chargeId);
+    charges = newCharges;
+    setChargesState(newCharges);
+    setSelectedCharge(null);
+    selectedChargeId = null;
+    
+    setChargeStack(prev => prev.filter(id => id !== chargeId));
+    
+    updateChargeMeshes();
+    scheduleVectorFieldUpdate(newCharges);
+  }, [chargesState, vectorFieldRenderer]);
+
+  const removeLastAdded = useCallback(() => {
+    if (chargeStack.length > 0) {
+      const lastChargeId = chargeStack[chargeStack.length - 1];
+      removeCharge(lastChargeId);
+    }
+  }, [chargeStack, removeCharge]);
+
+  const removeAllCharges = useCallback(() => {
+    charges = [];
+    setChargesState([]);
+    setSelectedCharge(null);
+    setChargeStack([]);
+    selectedChargeId = null;
+    updateChargeMeshes();
+    scheduleVectorFieldUpdate([]);
+  }, [vectorFieldRenderer]);
+
+  const selectCharge = useCallback((chargeId: string) => {
+    const charge = chargesState.find(c => c.id === chargeId);
+    if (charge) {
+      setSelectedCharge(charge);
+      selectedChargeId = chargeId;
+      updateChargeMeshes();
+    }
+  }, [chargesState]);
+
+  const updateChargeMagnitude = useCallback((chargeId: string, magnitude: number) => {
+    const newCharges = chargesState.map(charge => 
+      charge.id === chargeId ? { ...charge, magnitude } : charge
+    );
+    charges = newCharges;
+    setChargesState(newCharges);
+    updateChargeMeshes();
+    scheduleVectorFieldUpdate(newCharges);
+  }, [chargesState, vectorFieldRenderer]);
+
+  const updateChargePosition = useCallback((chargeId: string, position: THREE.Vector3) => {
+    const newCharges = chargesState.map(charge => 
+      charge.id === chargeId ? { ...charge, position: position.clone() } : charge
+    );
+    charges = newCharges;
+    setChargesState(newCharges);
+    updateChargeMeshes();
+    scheduleVectorFieldUpdate(newCharges);
+  }, [chargesState, vectorFieldRenderer]);
+
+  const handleMouseClick = useCallback((event: MouseEvent) => {
+    if (!controls) return;
+    
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObjects(Array.from(chargeMeshes.values()));
+    
+    if (intersects.length > 0) {
+      const clickedChargeId = intersects[0].object.userData.chargeId;
+      selectCharge(clickedChargeId);
+    } else {
+      setSelectedCharge(null);
+      selectedChargeId = null;
+      updateChargeMeshes();
+    }
+  }, [selectCharge]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -100,11 +262,13 @@ const ThreeWorkspace: React.FC = () => {
 
     onResize();
     window.addEventListener('resize', onResize);
+    renderer.domElement.addEventListener('click', handleMouseClick);
 
     animate();
 
     return () => {
       window.removeEventListener('resize', onResize);
+      renderer.domElement.removeEventListener('click', handleMouseClick);
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
@@ -112,7 +276,7 @@ const ThreeWorkspace: React.FC = () => {
         vectorFieldRenderer.dispose();
       }
     };
-  }, []);
+  }, [handleMouseClick]);
 
   const toggleVectorField = () => {
     const newVisibility = !showVectorField;
@@ -126,34 +290,198 @@ const ThreeWorkspace: React.FC = () => {
     <div style={{ position: 'relative', width: '100vw', height: '100vh' }}>
       <div ref={containerRef} style={{ width: '100%', height: '100%', background: '#282c34' }} />
       
-      {/* Simple control panel */}
+      {/* Control panel */}
       <div style={{
         position: 'absolute',
         top: '10px',
         left: '10px',
-        background: 'rgba(0, 0, 0, 0.7)',
+        background: 'rgba(0, 0, 0, 0.8)',
         color: 'white',
-        padding: '10px',
-        borderRadius: '5px',
+        padding: '15px',
+        borderRadius: '8px',
         fontFamily: 'monospace',
-        fontSize: '12px'
+        fontSize: '12px',
+        minWidth: '250px'
       }}>
-        <div>Electric Field Visualizer</div>
-        <div>Charges: {charges.length}</div>
+        <div style={{ fontSize: '14px', fontWeight: 'bold', marginBottom: '10px' }}>
+          Electric Field Visualizer
+        </div>
+        
+        <div style={{ marginBottom: '10px' }}>
+          <div>Charges: {chargesState.length}</div>
+          <div style={{ fontSize: '10px', color: '#ccc' }}>
+            Click charges to select, click empty space to deselect
+          </div>
+        </div>
+
+        <div style={{ marginBottom: '10px' }}>
+          <button 
+            onClick={addCharge}
+            style={{
+              padding: '8px 12px',
+              background: '#4CAF50',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              marginRight: '5px',
+              fontSize: '11px'
+            }}
+          >
+            + Add Charge
+          </button>
+          
+          {chargeStack.length > 0 && (
+            <button 
+              onClick={removeLastAdded}
+              style={{
+                padding: '8px 12px',
+                background: '#f44336',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                marginRight: '5px',
+                fontSize: '11px'
+              }}
+            >
+              - Remove Last Added
+            </button>
+          )}
+
+          {chargesState.length > 0 && (
+            <button 
+              onClick={removeAllCharges}
+              style={{
+                padding: '8px 12px',
+                background: '#ff6b6b',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '11px'
+              }}
+            >
+              🗑️ Remove All
+            </button>
+          )}
+        </div>
+
         <button 
           onClick={toggleVectorField}
           style={{
-            marginTop: '5px',
-            padding: '5px 10px',
+            padding: '8px 12px',
             background: showVectorField ? '#4CAF50' : '#f44336',
             color: 'white',
             border: 'none',
-            borderRadius: '3px',
-            cursor: 'pointer'
+            borderRadius: '4px',
+            cursor: 'pointer',
+            marginBottom: '10px',
+            fontSize: '11px'
           }}
         >
           {showVectorField ? 'Hide' : 'Show'} Vector Field
         </button>
+
+        {selectedCharge && (
+          <div style={{ 
+            border: '1px solid #555', 
+            padding: '10px', 
+            borderRadius: '4px',
+            backgroundColor: 'rgba(255, 255, 255, 0.1)'
+          }}>
+            <div style={{ fontWeight: 'bold', marginBottom: '8px' }}>
+              Selected Charge: {selectedCharge.id}
+            </div>
+            
+            <div style={{ marginBottom: '5px' }}>
+              <label style={{ display: 'block', marginBottom: '2px' }}>Magnitude (μC):</label>
+              <input
+                type="number"
+                value={(selectedCharge.magnitude * 1e6).toFixed(2)}
+                onChange={(e) => {
+                  const newMagnitude = parseFloat(e.target.value) * 1e-6;
+                  updateChargeMagnitude(selectedCharge.id, newMagnitude);
+                }}
+                style={{
+                  width: '100%',
+                  padding: '4px',
+                  borderRadius: '3px',
+                  border: '1px solid #555',
+                  background: 'rgba(255, 255, 255, 0.1)',
+                  color: 'white',
+                  fontSize: '11px'
+                }}
+              />
+            </div>
+
+            <div style={{ marginBottom: '5px' }}>
+              <label style={{ display: 'block', marginBottom: '2px' }}>Position X:</label>
+              <input
+                type="number"
+                value={selectedCharge.position.x.toFixed(2)}
+                onChange={(e) => {
+                  const newPos = selectedCharge.position.clone();
+                  newPos.x = parseFloat(e.target.value);
+                  updateChargePosition(selectedCharge.id, newPos);
+                }}
+                style={{
+                  width: '100%',
+                  padding: '4px',
+                  borderRadius: '3px',
+                  border: '1px solid #555',
+                  background: 'rgba(255, 255, 255, 0.1)',
+                  color: 'white',
+                  fontSize: '11px'
+                }}
+              />
+            </div>
+
+            <div style={{ marginBottom: '5px' }}>
+              <label style={{ display: 'block', marginBottom: '2px' }}>Position Y:</label>
+              <input
+                type="number"
+                value={selectedCharge.position.y.toFixed(2)}
+                onChange={(e) => {
+                  const newPos = selectedCharge.position.clone();
+                  newPos.y = parseFloat(e.target.value);
+                  updateChargePosition(selectedCharge.id, newPos);
+                }}
+                style={{
+                  width: '100%',
+                  padding: '4px',
+                  borderRadius: '3px',
+                  border: '1px solid #555',
+                  background: 'rgba(255, 255, 255, 0.1)',
+                  color: 'white',
+                  fontSize: '11px'
+                }}
+              />
+            </div>
+
+            <div>
+              <label style={{ display: 'block', marginBottom: '2px' }}>Position Z:</label>
+              <input
+                type="number"
+                value={selectedCharge.position.z.toFixed(2)}
+                onChange={(e) => {
+                  const newPos = selectedCharge.position.clone();
+                  newPos.z = parseFloat(e.target.value);
+                  updateChargePosition(selectedCharge.id, newPos);
+                }}
+                style={{
+                  width: '100%',
+                  padding: '4px',
+                  borderRadius: '3px',
+                  border: '1px solid #555',
+                  background: 'rgba(255, 255, 255, 0.1)',
+                  color: 'white',
+                  fontSize: '11px'
+                }}
+              />
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
