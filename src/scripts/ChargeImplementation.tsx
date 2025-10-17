@@ -1,10 +1,17 @@
-// import * as THREE from 'three';
+import React from 'react';
 
 // FDTD simulation of electric fields from point charges using WebGPU
 ///////////////////////////////////////////
+
+// Global variables
+let device: GPUDevice;
+let fdtdSimulation: FDTDSimulation;
+let renderContext: GPUCanvasContext;
+let renderPipeline: GPURenderPipeline;
+let renderConfigBuffer: GPUBuffer;
+let renderBindGroupLayout: GPUBindGroupLayout;
 const updateAlphaBeta = `
   @group(0) @binding(0) var materialTex: texture_2d<f32>;
-  @group(0) @binding(1) var materialSampler: sampler;
 
   struct SimParams {
     dt: f32,
@@ -12,9 +19,9 @@ const updateAlphaBeta = `
     _pad0: f32,
     _pad1: f32,
   };
-  @group(0) @binding(2) var<uniform> sim: SimParams;
+  @group(0) @binding(1) var<uniform> sim: SimParams;
 
-  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
+  @group(0) @binding(2) var outTex: texture_storage_2d<rgba32float, write>;
 
   @compute @workgroup_size(8, 8, 1)
   fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -23,11 +30,13 @@ const updateAlphaBeta = `
       return;
     }
 
-    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
-    let mat = textureSample(materialTex, materialSampler, uv).rgb;
-    let permeability = mat.x;
-    let permittivity = mat.y;
-    let conductivity = mat.z;
+    let coord = vec2<i32>(gid.xy);
+    let mat = textureLoad(materialTex, coord, 0).rgb;
+    
+    // Scale normalized values back to physical constants
+    let permeability = 4.0 * 3.14159 * 1e-7; // μ₀ (vacuum permeability)
+    let permittivity = 8.854187817e-12; // ε₀ (vacuum permittivity)
+    let conductivity = 0.0; // σ (no conductivity for vacuum)
 
     let cEl = conductivity * sim.dt / (2.0 * permeability);
     let dEl = 1.0 / (1.0 + cEl);
@@ -39,7 +48,7 @@ const updateAlphaBeta = `
     let alphaMag = (1.0 - cMag) * dMag;
     let betaMag = sim.dt / (permittivity * sim.cellSize) * dMag;
 
-    textureStore(outTex, vec2<i32>(gid.xy), vec4<f32>(alphaEl, betaEl, alphaMag, betaMag));
+    textureStore(outTex, coord, vec4<f32>(alphaEl, betaEl, alphaMag, betaMag));
   }
 `;
 
@@ -47,16 +56,15 @@ const updateElectric = `
   @group(0) @binding(0) var electricFieldTex: texture_2d<f32>;
   @group(0) @binding(1) var magneticFieldTex: texture_2d<f32>;
   @group(0) @binding(2) var alphaBetaFieldTex: texture_2d<f32>;
-  @group(0) @binding(3) var fieldSampler: sampler;
 
   struct FieldParams {
     relativeCellSize: vec2<f32>,
     reflectiveBoundary: u32,
     _pad: u32,
   };
-  @group(0) @binding(4) var<uniform> params: FieldParams;
+  @group(0) @binding(3) var<uniform> params: FieldParams;
 
-  @group(0) @binding(5) var outTex: texture_storage_2d<rgba32float, write>;
+  @group(0) @binding(4) var outTex: texture_storage_2d<rgba32float, write>;
 
   @compute @workgroup_size(8, 8, 1)
   fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -65,30 +73,30 @@ const updateElectric = `
       return;
     }
 
-    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let coord = vec2<i32>(gid.xy);
 
     if (params.reflectiveBoundary == 0u) {
-      let b = 2.0 * params.relativeCellSize;
+      let b = vec2<i32>(2.0 * params.relativeCellSize * vec2<f32>(dims));
       
-      let xAtMinBound = select(0.0, params.relativeCellSize.x, uv.x < b.x);
-      let xAtMaxBound = select(0.0, -params.relativeCellSize.x, uv.x + b.x >= 1.0);
-      let yAtMinBound = select(0.0, params.relativeCellSize.y, uv.y < b.y);
-      let yAtMaxBound = select(0.0, -params.relativeCellSize.y, uv.y + b.y >= 1.0);
+      let xAtMinBound = select(0, i32(params.relativeCellSize.x * f32(dims.x)), coord.x < b.x);
+      let xAtMaxBound = select(0, -i32(params.relativeCellSize.x * f32(dims.x)), coord.x + b.x >= i32(dims.x));
+      let yAtMinBound = select(0, i32(params.relativeCellSize.y * f32(dims.y)), coord.y < b.y);
+      let yAtMaxBound = select(0, -i32(params.relativeCellSize.y * f32(dims.y)), coord.y + b.y >= i32(dims.y));
 
-      if (xAtMinBound != 0.0 || xAtMaxBound != 0.0 || yAtMinBound != 0.0 || yAtMaxBound != 0.0) {
-        let boundaryUV = uv + vec2<f32>(xAtMinBound + xAtMaxBound, yAtMinBound + yAtMaxBound);
-        let boundaryField = textureSample(electricFieldTex, fieldSampler, boundaryUV);
-        textureStore(outTex, vec2<i32>(gid.xy), boundaryField);
+      if (xAtMinBound != 0 || xAtMaxBound != 0 || yAtMinBound != 0 || yAtMaxBound != 0) {
+        let boundaryCoord = coord + vec2<i32>(xAtMinBound + xAtMaxBound, yAtMinBound + yAtMaxBound);
+        let boundaryField = textureLoad(electricFieldTex, boundaryCoord, 0);
+        textureStore(outTex, coord, boundaryField);
         return;
       }
     }
 
-    let alphaBeta = textureSample(alphaBetaFieldTex, fieldSampler, uv).rg;
+    let alphaBeta = textureLoad(alphaBetaFieldTex, coord, 0).rg;
     
-    let el = textureSample(electricFieldTex, fieldSampler, uv).rgb;
-    let mag = textureSample(magneticFieldTex, fieldSampler, uv).rgb;
-    let magXN = textureSample(magneticFieldTex, fieldSampler, uv - vec2<f32>(params.relativeCellSize.x, 0.0)).rgb;
-    let magYN = textureSample(magneticFieldTex, fieldSampler, uv - vec2<f32>(0.0, params.relativeCellSize.y)).rgb;
+    let el = textureLoad(electricFieldTex, coord, 0).rgb;
+    let mag = textureLoad(magneticFieldTex, coord, 0).rgb;
+    let magXN = textureLoad(magneticFieldTex, coord - vec2<i32>(i32(params.relativeCellSize.x * f32(dims.x)), 0), 0).rgb;
+    let magYN = textureLoad(magneticFieldTex, coord - vec2<i32>(0, i32(params.relativeCellSize.y * f32(dims.y))), 0).rgb;
 
     let newEl = vec3<f32>(
       alphaBeta.x * el.x + alphaBeta.y * (mag.z - magYN.z),
@@ -96,7 +104,7 @@ const updateElectric = `
       alphaBeta.x * el.z + alphaBeta.y * ((mag.y - magXN.y) - (mag.x - magYN.x))
     );
 
-    textureStore(outTex, vec2<i32>(gid.xy), vec4<f32>(newEl, 0.0));
+    textureStore(outTex, coord, vec4<f32>(newEl, 0.0));
   }
 `;
 
@@ -104,16 +112,15 @@ const updateMagnetic = `
   @group(0) @binding(0) var electricFieldTex: texture_2d<f32>;
   @group(0) @binding(1) var magneticFieldTex: texture_2d<f32>;
   @group(0) @binding(2) var alphaBetaFieldTex: texture_2d<f32>;
-  @group(0) @binding(3) var fieldSampler: sampler;
 
   struct FieldParams {
     relativeCellSize: vec2<f32>,
     reflectiveBoundary: u32,
     _pad: u32,
   };
-  @group(0) @binding(4) var<uniform> params: FieldParams;
+  @group(0) @binding(3) var<uniform> params: FieldParams;
 
-  @group(0) @binding(5) var outTex: texture_storage_2d<rgba32float, write>;
+  @group(0) @binding(4) var outTex: texture_storage_2d<rgba32float, write>;
 
   @compute @workgroup_size(8, 8, 1)
   fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -122,30 +129,30 @@ const updateMagnetic = `
       return;
     }
 
-    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let coord = vec2<i32>(gid.xy);
 
     if (params.reflectiveBoundary == 0u) {
-      let b = 2.0 * params.relativeCellSize;
+      let b = vec2<i32>(2.0 * params.relativeCellSize * vec2<f32>(dims));
       
-      let xAtMinBound = select(0.0, params.relativeCellSize.x, uv.x < b.x);
-      let xAtMaxBound = select(0.0, -params.relativeCellSize.x, uv.x + b.x >= 1.0);
-      let yAtMinBound = select(0.0, params.relativeCellSize.y, uv.y < b.y);
-      let yAtMaxBound = select(0.0, -params.relativeCellSize.y, uv.y + b.y >= 1.0);
+      let xAtMinBound = select(0, i32(params.relativeCellSize.x * f32(dims.x)), coord.x < b.x);
+      let xAtMaxBound = select(0, -i32(params.relativeCellSize.x * f32(dims.x)), coord.x + b.x >= i32(dims.x));
+      let yAtMinBound = select(0, i32(params.relativeCellSize.y * f32(dims.y)), coord.y < b.y);
+      let yAtMaxBound = select(0, -i32(params.relativeCellSize.y * f32(dims.y)), coord.y + b.y >= i32(dims.y));
 
-      if (xAtMinBound != 0.0 || xAtMaxBound != 0.0 || yAtMinBound != 0.0 || yAtMaxBound != 0.0) {
-        let boundaryUV = uv + vec2<f32>(xAtMinBound + xAtMaxBound, yAtMinBound + yAtMaxBound);
-        let boundaryField = textureSample(magneticFieldTex, fieldSampler, boundaryUV);
-        textureStore(outTex, vec2<i32>(gid.xy), boundaryField);
+      if (xAtMinBound != 0 || xAtMaxBound != 0 || yAtMinBound != 0 || yAtMaxBound != 0) {
+        let boundaryCoord = coord + vec2<i32>(xAtMinBound + xAtMaxBound, yAtMinBound + yAtMaxBound);
+        let boundaryField = textureLoad(magneticFieldTex, boundaryCoord, 0);
+        textureStore(outTex, coord, boundaryField);
         return;
       }
     }
 
-    let alphaBeta = textureSample(alphaBetaFieldTex, fieldSampler, uv).ba;
+    let alphaBeta = textureLoad(alphaBetaFieldTex, coord, 0).ba;
 
-    let mag = textureSample(magneticFieldTex, fieldSampler, uv).rgb;
-    let el = textureSample(electricFieldTex, fieldSampler, uv).rgb;
-    let elXP = textureSample(electricFieldTex, fieldSampler, uv + vec2<f32>(params.relativeCellSize.x, 0.0)).rgb;
-    let elYP = textureSample(electricFieldTex, fieldSampler, uv + vec2<f32>(0.0, params.relativeCellSize.y)).rgb;
+    let mag = textureLoad(magneticFieldTex, coord, 0).rgb;
+    let el = textureLoad(electricFieldTex, coord, 0).rgb;
+    let elXP = textureLoad(electricFieldTex, coord + vec2<i32>(i32(params.relativeCellSize.x * f32(dims.x)), 0), 0).rgb;
+    let elYP = textureLoad(electricFieldTex, coord + vec2<i32>(0, i32(params.relativeCellSize.y * f32(dims.y))), 0).rgb;
 
     let newMag = vec3<f32>(
       alphaBeta.x * mag.x - alphaBeta.y * (elYP.z - el.z),
@@ -153,7 +160,7 @@ const updateMagnetic = `
       alphaBeta.x * mag.z - alphaBeta.y * ((elXP.y - el.y) - (elYP.x - el.x))
     );
 
-    textureStore(outTex, vec2<i32>(gid.xy), vec4<f32>(newMag, 0.0));
+    textureStore(outTex, coord, vec4<f32>(newMag, 0.0));
   }
 `;
 
@@ -197,7 +204,6 @@ const updateMagnetic = `
 const injectSource = `
   @group(0) @binding(0) var sourceFieldTex: texture_2d<f32>;
   @group(0) @binding(1) var fieldTex: texture_2d<f32>;
-  @group(0) @binding(2) var fieldSampler: sampler;
 
   struct SourceParams {
     dt: f32,
@@ -205,9 +211,9 @@ const injectSource = `
     _pad1: f32,
     _pad2: f32,
   };
-  @group(0) @binding(3) var<uniform> params: SourceParams;
+  @group(0) @binding(2) var<uniform> params: SourceParams;
 
-  @group(0) @binding(4) var outTex: texture_storage_2d<rgba32float, write>;
+  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
 
   @compute @workgroup_size(8, 8, 1)
   fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -216,18 +222,17 @@ const injectSource = `
       return;
     }
 
-    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let coord = vec2<i32>(gid.xy);
     
-    let source = textureSample(sourceFieldTex, fieldSampler, uv);
-    let field = textureSample(fieldTex, fieldSampler, uv);
+    let source = textureLoad(sourceFieldTex, coord, 0);
+    let field = textureLoad(fieldTex, coord, 0);
 
-    textureStore(outTex, vec2<i32>(gid.xy), field + params.dt * source);
+    textureStore(outTex, coord, field + params.dt * source);
   }
 `;
 
 const decaySource = `
   @group(0) @binding(0) var sourceFieldTex: texture_2d<f32>;
-  @group(0) @binding(1) var fieldSampler: sampler;
 
   struct DecayParams {
     dt: f32,
@@ -235,9 +240,9 @@ const decaySource = `
     _pad1: f32,
     _pad2: f32,
   };
-  @group(0) @binding(2) var<uniform> params: DecayParams;
+  @group(0) @binding(1) var<uniform> params: DecayParams;
 
-  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
+  @group(0) @binding(2) var outTex: texture_storage_2d<rgba32float, write>;
 
   @compute @workgroup_size(8, 8, 1)
   fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -246,18 +251,17 @@ const decaySource = `
       return;
     }
 
-    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let coord = vec2<i32>(gid.xy);
     
-    let source = textureSample(sourceFieldTex, fieldSampler, uv);
+    let source = textureLoad(sourceFieldTex, coord, 0);
     let decayedSource = source * pow(0.1, params.dt);
 
-    textureStore(outTex, vec2<i32>(gid.xy), decayedSource);
+    textureStore(outTex, coord, decayedSource);
   }
 `;
 
 const drawSquare = `
   @group(0) @binding(0) var inputTex: texture_2d<f32>;
-  @group(0) @binding(1) var fieldSampler: sampler;
 
   struct DrawParams {
     pos: vec2<f32>,
@@ -265,9 +269,9 @@ const drawSquare = `
     value: vec4<f32>,
     keep: vec4<f32>,
   };
-  @group(0) @binding(2) var<uniform> params: DrawParams;
+  @group(0) @binding(1) var<uniform> params: DrawParams;
 
-  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
+  @group(0) @binding(2) var outTex: texture_storage_2d<rgba32float, write>;
 
   @compute @workgroup_size(8, 8, 1)
   fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -276,19 +280,19 @@ const drawSquare = `
       return;
     }
 
-    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let coord = vec2<i32>(gid.xy);
+    let uv = (vec2<f32>(coord) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
     let d = abs(params.pos - uv);
-    let oldValue = textureSample(inputTex, fieldSampler, uv);
+    let oldValue = textureLoad(inputTex, coord, 0);
     let within = all(d <= params.size);
 
     let result = select(oldValue, params.value + params.keep * oldValue, within);
-    textureStore(outTex, vec2<i32>(gid.xy), result);
+    textureStore(outTex, coord, result);
   }
 `;
 
 const drawEllipse = `
   @group(0) @binding(0) var inputTex: texture_2d<f32>;
-  @group(0) @binding(1) var fieldSampler: sampler;
 
   struct DrawParams {
     pos: vec2<f32>,
@@ -296,9 +300,9 @@ const drawEllipse = `
     value: vec4<f32>,
     keep: vec4<f32>,
   };
-  @group(0) @binding(2) var<uniform> params: DrawParams;
+  @group(0) @binding(1) var<uniform> params: DrawParams;
 
-  @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
+  @group(0) @binding(2) var outTex: texture_storage_2d<rgba32float, write>;
 
   @compute @workgroup_size(8, 8, 1)
   fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -307,19 +311,22 @@ const drawEllipse = `
       return;
     }
 
-    let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
+    let coord = vec2<i32>(gid.xy);
+    let uv = (vec2<f32>(coord) + vec2<f32>(0.5, 0.5)) / vec2<f32>(dims);
     let d = (params.pos - uv) / params.radius;
     let distanceSquared = dot(d, d);
     let within = distanceSquared <= 1.0;
     
-    let oldValue = textureSample(inputTex, fieldSampler, uv);
+    let oldValue = textureLoad(inputTex, coord, 0);
     let result = select(oldValue, params.value + params.keep * oldValue, within);
     
-    textureStore(outTex, vec2<i32>(gid.xy), result);
+    textureStore(outTex, coord, result);
   }
 `;
 
 // Add the missing point charge shader
+// Point charge shader (reserved for future use)
+/*
 const pointChargeShader = `
 @group(0) @binding(0) var<storage, read> charges: array<vec4<f32>>; // xyz: position, w: magnitude
 @group(0) @binding(1) var<uniform> gridConfig: vec4<f32>; // x: gridSizeX, y: gridSizeY, z: gridSizeZ, w: spacing
@@ -355,6 +362,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     fieldOutput[index] = vec4<f32>(totalField, totalPotential);
 }`;
+*/
 
 // Add field visualization shaders
 const fieldVertShader = `
@@ -381,36 +389,66 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
 }`;
 
 const fieldFragShader = `
-@group(0) @binding(0) var fieldTexture: texture_2d<f32>;
-@group(0) @binding(1) var fieldSampler: sampler;
-
-struct RenderConfig {
-  gridSize: f32,
-  maxPotential: f32,
-  minPotential: f32,
-  time: f32,
-};
-@group(0) @binding(2) var<uniform> config: RenderConfig;
+@group(0) @binding(0) var electricFieldTexture: texture_2d<f32>;
+@group(0) @binding(1) var magneticFieldTexture: texture_2d<f32>;
+@group(0) @binding(2) var materialTexture: texture_2d<f32>;
+@group(0) @binding(3) var<uniform> config: vec4<f32>; // brightness, electricEnergyFactor, magneticEnergyFactor, time
 
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
-  let field = textureSample(fieldTexture, fieldSampler, uv);
-  let electricField = field.xyz;
-  let potential = field.w;
+  let dims = textureDimensions(electricFieldTexture);
+  let coord = vec2<i32>(uv * vec2<f32>(dims));
   
-  // Normalize potential for color mapping
-  let normalizedPotential = (potential - config.minPotential) / (config.maxPotential - config.minPotential);
+  // Sample field values
+  let electricField = textureLoad(electricFieldTexture, coord, 0).xyz;
+  let magneticField = textureLoad(magneticFieldTexture, coord, 0).xyz;
+  let material = textureLoad(materialTexture, coord, 0).xyz;
   
-  // Color based on electric field magnitude and potential
-  let fieldMagnitude = length(electricField.xy);
-  let normalizedField = clamp(fieldMagnitude / 1000.0, 0.0, 1.0);
+  // Extract config values
+  let brightness = config.x;
+  let electricEnergyFactor = config.y;
+  let magneticEnergyFactor = config.z;
   
-  // Create a color based on potential (blue to red)
-  let r = clamp(normalizedPotential, 0.0, 1.0);
-  let b = clamp(1.0 - normalizedPotential, 0.0, 1.0);
-  let g = normalizedField * 0.5;
+  // Scale material values from [0,1] range back to physical values
+  // Material texture stores normalized values that need to be scaled back
+  let permittivity = (material.x - 0.5) * 8.0 + 1.0; // Scale around 1.0
+  let permeability = (material.y - 0.5) * 8.0 + 1.0; // Scale around 1.0
   
-  return vec4<f32>(r, g, b, 1.0);
+  // Calculate energy densities (simplified from reference)
+  let electricEnergy = electricEnergyFactor * permittivity * dot(electricField, electricField);
+  let magneticEnergy = magneticEnergyFactor * permeability * dot(magneticField, magneticField);
+  
+  // Apply brightness scaling
+  let brightnessSquared = brightness * brightness;
+  let totalEnergy = brightnessSquared * (electricEnergy + magneticEnergy);
+  
+  // Simple bloom-like effect - extract bright areas
+  let bloomThreshold = 0.1;
+  let bloomValue = step(bloomThreshold, totalEnergy) * totalEnergy * 0.5;
+  
+  // Final color combining energy and bloom
+  let finalIntensity = clamp(totalEnergy + bloomValue, 0.0, 1.0);
+  
+  // Color mapping: black -> blue -> cyan -> yellow -> white
+  var color = vec3<f32>(0.0, 0.0, 0.0);
+  if (finalIntensity > 0.001) {
+    if (finalIntensity < 0.25) {
+      // Black to blue
+      color = vec3<f32>(0.0, 0.0, finalIntensity * 4.0);
+    } else if (finalIntensity < 0.5) {
+      // Blue to cyan
+      color = vec3<f32>(0.0, (finalIntensity - 0.25) * 4.0, 1.0);
+    } else if (finalIntensity < 0.75) {
+      // Cyan to yellow
+      color = vec3<f32>((finalIntensity - 0.5) * 4.0, 1.0, 1.0 - (finalIntensity - 0.5) * 4.0);
+    } else {
+      // Yellow to white
+      let whiteAmount = (finalIntensity - 0.75) * 4.0;
+      color = vec3<f32>(1.0, 1.0, whiteAmount);
+    }
+  }
+  
+  return vec4<f32>(color, 1.0);
 }`;
 
 // Enhanced FDTD Simulation class
@@ -424,6 +462,7 @@ class FDTDSimulation {
   private dt: number = 0.001;
   private cellSize: number = 0.01;
   private time: number = 0;
+  private alphaBetaDt: number = 0.001; // Track dt used for alpha-beta calculation
 
   constructor(device: GPUDevice, textureSize: number = 512) {
     this.device = device;
@@ -452,15 +491,36 @@ class FDTDSimulation {
     };
 
     for (const [name, shader] of Object.entries(shaders)) {
-      const module = this.device.createShaderModule({ code: shader });
-      const pipeline = this.device.createComputePipeline({
-        layout: 'auto',
-        compute: {
-          module,
-          entryPoint: 'main',
-        },
-      });
-      this.pipelines.set(name, pipeline);
+      try {
+        console.log(`Creating shader module: ${name}`);
+        const module = this.device.createShaderModule({
+          code: shader,
+          label: `${name}_shader_module`
+        });
+
+        // Check for compilation info
+        const compilationInfo = await module.getCompilationInfo();
+        if (compilationInfo.messages.length > 0) {
+          console.log(`Shader ${name} compilation info:`, compilationInfo.messages);
+          for (const message of compilationInfo.messages) {
+            console.log(`  ${message.type}: ${message.message} at line ${message.lineNum}, pos ${message.linePos}`);
+          }
+        }
+
+        const pipeline = this.device.createComputePipeline({
+          layout: 'auto',
+          compute: {
+            module,
+            entryPoint: 'main',
+          },
+          label: `${name}_pipeline`,
+        });
+        this.pipelines.set(name, pipeline);
+      } catch (error) {
+        console.error(`Error creating shader ${name}:`, error);
+        console.log(`Shader code for ${name}:`, shader);
+        throw error;
+      }
     }
   }
 
@@ -473,8 +533,9 @@ class FDTDSimulation {
 
     // Create auxiliary textures
     this.createTexture('alphaBetaField', this.textureSize, this.textureSize);
-    this.createTexture('materialField', this.textureSize, this.textureSize);
+    this.createTexture('materialField', this.textureSize, this.textureSize, 'rgba8unorm'); // Use widely supported filterable format
     this.createTexture('sourceField', this.textureSize, this.textureSize);
+    this.createTexture('sourceFieldNext', this.textureSize, this.textureSize); // Add double buffer for source field
 
     // Initialize material properties (vacuum by default)
     this.initializeMaterialField();
@@ -483,18 +544,19 @@ class FDTDSimulation {
 
   private initializeMaterialField() {
     // Initialize with vacuum properties
-    const materialData = new Float32Array(this.textureSize * this.textureSize * 4);
+    // For rgba8unorm, we need to normalize values to [0,1] and scale in shader
+    const materialData = new Uint8Array(this.textureSize * this.textureSize * 4);
     for (let i = 0; i < materialData.length; i += 4) {
-      materialData[i] = 4.0 * Math.PI * 1e-7; // permeability (μ₀)
-      materialData[i + 1] = 8.854187817e-12; // permittivity (ε₀)  
-      materialData[i + 2] = 0.0; // conductivity (σ)
-      materialData[i + 3] = 0.0; // unused
+      materialData[i] = 128; // permeability - neutral value, will scale in shader
+      materialData[i + 1] = 128; // permittivity - neutral value, will scale in shader  
+      materialData[i + 2] = 0; // conductivity (σ)
+      materialData[i + 3] = 255; // unused - full alpha
     }
 
     this.device.queue.writeTexture(
       { texture: this.textures.get('materialField')! },
       materialData,
-      { bytesPerRow: this.textureSize * 16 },
+      { bytesPerRow: this.textureSize * 4 }, // rgba8unorm = 4 channels * 1 byte = 4 bytes per pixel
       { width: this.textureSize, height: this.textureSize }
     );
   }
@@ -511,9 +573,8 @@ class FDTDSimulation {
       layout: this.pipelines.get('updateAlphaBeta')!.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: this.textures.get('materialField')!.createView() },
-        { binding: 1, resource: this.sampler },
-        { binding: 2, resource: { buffer: simBuffer } },
-        { binding: 3, resource: this.textures.get('alphaBetaField')!.createView() },
+        { binding: 1, resource: { buffer: simBuffer } },
+        { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
       ],
     });
 
@@ -525,7 +586,8 @@ class FDTDSimulation {
     const texture = this.device.createTexture({
       size: [width, height],
       format,
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+      label: `${name}_texture`,
     });
     this.textures.set(name, texture);
     return texture;
@@ -539,14 +601,18 @@ class FDTDSimulation {
 
   // Add a point charge source - Fixed to avoid circular reference
   addPointCharge(x: number, y: number, charge: number) {
+    console.log(`Adding charge: x=${x}, y=${y}, charge=${charge}`);
+
     const nx = (x + 1) * 0.5; // Convert from [-1,1] to [0,1]
     const ny = (y + 1) * 0.5;
 
+    console.log(`Normalized position: nx=${nx}, ny=${ny}`);
+
     const drawParams = new Float32Array([
       nx, ny, // position in [0,1] space
-      0.02, 0.02, // radius
-      0, 0, charge * 1e3, 0, // value (electric field source) - reduced scaling
-      0, 0, 0, 0, // keep (don't keep old values for sources)
+      0.1, 0.1, // slightly larger radius for visibility
+      0, 0, charge * 1000, 0, // much larger charge magnitude for debugging
+      1, 1, 1, 1, // keep existing values (additive)
     ]);
 
     const paramsBuffer = this.device.createBuffer({
@@ -559,16 +625,15 @@ class FDTDSimulation {
     const tempTexture = this.device.createTexture({
       size: [this.textureSize, this.textureSize],
       format: 'rgba32float',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
     });
 
     const bindGroup = this.device.createBindGroup({
       layout: this.pipelines.get('drawEllipse')!.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: this.textures.get('sourceField')!.createView() },
-        { binding: 1, resource: this.sampler },
-        { binding: 2, resource: { buffer: paramsBuffer } },
-        { binding: 3, resource: tempTexture.createView() },
+        { binding: 1, resource: { buffer: paramsBuffer } },
+        { binding: 2, resource: tempTexture.createView() },
       ],
     });
 
@@ -578,6 +643,9 @@ class FDTDSimulation {
     // Copy result back to source field
     this.copyTexture(tempTexture, this.textures.get('sourceField')!);
     tempTexture.destroy();
+    paramsBuffer.destroy();
+
+    console.log('Charge added successfully');
   }
 
   private copyTexture(source: GPUTexture, destination: GPUTexture) {
@@ -590,27 +658,74 @@ class FDTDSimulation {
     this.device.queue.submit([commandEncoder.finish()]);
   }
 
-  // Main simulation step
+  // Main simulation step - Fixed to match reference implementation
   step() {
-    this.time += this.dt;
+    const dt = this.dt;
 
-    // Update electric field
-    this.updateElectricField();
+    // Step electric field (first half of time step)
+    this.stepElectric(dt);
 
-    // Update magnetic field  
-    this.updateMagneticField();
+    // Step magnetic field (second half of time step) 
+    this.stepMagnetic(dt);
+  }
 
-    // Inject sources
+  private stepElectric(dt: number) {
+    // Update alpha-beta if needed
+    this.updateAlphaBetaFromMaterial(dt);
+
+    // Inject sources into electric field
     this.injectSources();
 
     // Decay sources
     this.decaySources();
 
-    // Swap buffers
-    this.swapBuffers();
+    // Update electric field
+    this.updateElectricField();
+
+    // Advance time by half step
+    this.time += dt / 2;
+  }
+
+  private stepMagnetic(dt: number) {
+    // Update magnetic field  
+    this.updateMagneticField();
+
+    // Advance time by half step
+    this.time += dt / 2;
+  }
+
+  private updateAlphaBetaFromMaterial(dt: number) {
+    // Only update if dt changed
+    if (this.alphaBetaDt !== dt) {
+      this.alphaBetaDt = dt;
+
+      const simParams = new Float32Array([dt, this.cellSize, 0, 0]);
+      const simBuffer = this.device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(simBuffer, 0, simParams);
+
+      const bindGroup = this.device.createBindGroup({
+        layout: this.pipelines.get('updateAlphaBeta')!.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.textures.get('materialField')!.createView() },
+          { binding: 1, resource: { buffer: simBuffer } },
+          { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
+        ],
+      });
+
+      this.runComputePass('updateAlphaBeta', bindGroup,
+        Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+      simBuffer.destroy();
+    }
   }
 
   private updateElectricField() {
+    // Swap electric field buffers before writing
+    this.swapElectricBuffers();
+
     const fieldParams = new Float32Array([
       1.0 / this.textureSize, 1.0 / this.textureSize, // relativeCellSize
       0, 0, // reflectiveBoundary = false, padding
@@ -625,20 +740,24 @@ class FDTDSimulation {
     const bindGroup = this.device.createBindGroup({
       layout: this.pipelines.get('updateElectric')!.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: this.textures.get('electricField')!.createView() },
-        { binding: 1, resource: this.textures.get('magneticField')!.createView() },
+        { binding: 0, resource: this.textures.get('electricFieldNext')!.createView() }, // Previous electric field
+        { binding: 1, resource: this.textures.get('magneticField')!.createView() }, // Current magnetic field
         { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
-        { binding: 3, resource: this.sampler },
-        { binding: 4, resource: { buffer: paramsBuffer } },
-        { binding: 5, resource: this.textures.get('electricFieldNext')!.createView() },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+        { binding: 4, resource: this.textures.get('electricField')!.createView() }, // Write to current
       ],
     });
 
     this.runComputePass('updateElectric', bindGroup,
       Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    paramsBuffer.destroy();
   }
 
   private updateMagneticField() {
+    // Swap magnetic field buffers before writing
+    this.swapMagneticBuffers();
+
     const fieldParams = new Float32Array([
       1.0 / this.textureSize, 1.0 / this.textureSize, // relativeCellSize
       0, 0, // reflectiveBoundary = false, padding
@@ -653,20 +772,24 @@ class FDTDSimulation {
     const bindGroup = this.device.createBindGroup({
       layout: this.pipelines.get('updateMagnetic')!.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: this.textures.get('electricField')!.createView() },
-        { binding: 1, resource: this.textures.get('magneticField')!.createView() },
+        { binding: 0, resource: this.textures.get('electricField')!.createView() }, // Current electric field
+        { binding: 1, resource: this.textures.get('magneticFieldNext')!.createView() }, // Previous magnetic field
         { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
-        { binding: 3, resource: this.sampler },
-        { binding: 4, resource: { buffer: paramsBuffer } },
-        { binding: 5, resource: this.textures.get('magneticFieldNext')!.createView() },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+        { binding: 4, resource: this.textures.get('magneticField')!.createView() }, // Write to current
       ],
     });
 
     this.runComputePass('updateMagnetic', bindGroup,
       Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    paramsBuffer.destroy();
   }
 
   private injectSources() {
+    // Swap source field buffers
+    this.swapSourceBuffers();
+
     const sourceParams = new Float32Array([this.dt, 0, 0, 0]);
     const paramsBuffer = this.device.createBuffer({
       size: 16,
@@ -674,19 +797,30 @@ class FDTDSimulation {
     });
     this.device.queue.writeBuffer(paramsBuffer, 0, sourceParams);
 
+    // Create temporary texture for output
+    const tempTexture = this.device.createTexture({
+      size: [this.textureSize, this.textureSize],
+      format: 'rgba32float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+
     const bindGroup = this.device.createBindGroup({
       layout: this.pipelines.get('injectSource')!.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: this.textures.get('sourceField')!.createView() },
-        { binding: 1, resource: this.textures.get('electricFieldNext')!.createView() },
-        { binding: 2, resource: this.sampler },
-        { binding: 3, resource: { buffer: paramsBuffer } },
-        { binding: 4, resource: this.textures.get('electricFieldNext')!.createView() },
+        { binding: 0, resource: this.textures.get('sourceFieldNext')!.createView() }, // Previous source field
+        { binding: 1, resource: this.textures.get('electricFieldNext')!.createView() }, // Previous electric field
+        { binding: 2, resource: { buffer: paramsBuffer } },
+        { binding: 3, resource: tempTexture.createView() },
       ],
     });
 
     this.runComputePass('injectSource', bindGroup,
       Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    // Copy result back to current electric field
+    this.copyTexture(tempTexture, this.textures.get('electricField')!);
+    tempTexture.destroy();
+    paramsBuffer.destroy();
   }
 
   private decaySources() {
@@ -701,37 +835,46 @@ class FDTDSimulation {
     const tempTexture = this.device.createTexture({
       size: [this.textureSize, this.textureSize],
       format: 'rgba32float',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
     });
 
     const bindGroup = this.device.createBindGroup({
       layout: this.pipelines.get('decaySource')!.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: this.textures.get('sourceField')!.createView() },
-        { binding: 1, resource: this.sampler },
-        { binding: 2, resource: { buffer: paramsBuffer } },
-        { binding: 3, resource: tempTexture.createView() },
+        { binding: 0, resource: this.textures.get('sourceFieldNext')!.createView() }, // Previous source field
+        { binding: 1, resource: { buffer: paramsBuffer } },
+        { binding: 2, resource: tempTexture.createView() },
       ],
     });
 
     this.runComputePass('decaySource', bindGroup,
       Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
 
-    // Copy result back
+    // Copy result back to current source field
     this.copyTexture(tempTexture, this.textures.get('sourceField')!);
     tempTexture.destroy();
+    paramsBuffer.destroy();
   }
 
-  private swapBuffers() {
-    // Swap electric field buffers
-    const tempE = this.textures.get('electricField');
-    this.textures.set('electricField', this.textures.get('electricFieldNext')!);
-    this.textures.set('electricFieldNext', tempE!);
+  private swapSourceBuffers() {
+    // Swap source field buffers
+    const temp = this.textures.get('sourceField');
+    this.textures.set('sourceField', this.textures.get('sourceFieldNext')!);
+    this.textures.set('sourceFieldNext', temp!);
+  }
 
+  private swapElectricBuffers() {
+    // Swap electric field buffers
+    const temp = this.textures.get('electricField');
+    this.textures.set('electricField', this.textures.get('electricFieldNext')!);
+    this.textures.set('electricFieldNext', temp!);
+  }
+
+  private swapMagneticBuffers() {
     // Swap magnetic field buffers
-    const tempM = this.textures.get('magneticField');
+    const temp = this.textures.get('magneticField');
     this.textures.set('magneticField', this.textures.get('magneticFieldNext')!);
-    this.textures.set('magneticFieldNext', tempM!);
+    this.textures.set('magneticFieldNext', temp!);
   }
 
   runComputePass(pipelineName: string, bindGroup: GPUBindGroup, workgroupsX: number, workgroupsY: number = 1, workgroupsZ: number = 1) {
@@ -781,7 +924,7 @@ class FDTDSimulation {
 }
 
 // Setup render pipeline for FDTD - Fixed device access issue
-const setupFDTDRenderPipeline = async (fdtdSim: FDTDSimulation, gpuDevice: GPUDevice) => {
+const setupFDTDRenderPipeline = async (_fdtdSim: FDTDSimulation, gpuDevice: GPUDevice) => {
   // Get or create the canvas element
   let canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement | null;
   if (!canvas) {
@@ -789,8 +932,13 @@ const setupFDTDRenderPipeline = async (fdtdSim: FDTDSimulation, gpuDevice: GPUDe
     canvas.id = 'fdtd-canvas';
     canvas.width = 512;
     canvas.height = 512;
-    canvas.style.display = 'block';
+    // Fix canvas styling
+    canvas.style.position = 'fixed';
+    canvas.style.top = '50%';
+    canvas.style.left = '50%';
+    canvas.style.transform = 'translate(-50%, -50%)';
     canvas.style.border = '1px solid #ccc';
+    canvas.style.zIndex = '1000';
     document.body.appendChild(canvas);
   }
 
@@ -804,15 +952,60 @@ const setupFDTDRenderPipeline = async (fdtdSim: FDTDSimulation, gpuDevice: GPUDe
   });
 
   const vertexModule = gpuDevice.createShaderModule({
-    code: fieldVertShader
+    code: fieldVertShader,
+    label: 'field_vertex_shader'
   });
 
   const fragmentModule = gpuDevice.createShaderModule({
-    code: fieldFragShader
+    code: fieldFragShader,
+    label: 'field_fragment_shader'
+  });
+
+  // Create explicit bind group layout to avoid auto-layout issues
+  renderBindGroupLayout = gpuDevice.createBindGroupLayout({
+    entries: [
+      {
+        binding: 0,
+        visibility: GPUShaderStage.FRAGMENT,
+        texture: {
+          sampleType: 'unfilterable-float',
+          viewDimension: '2d',
+        },
+      },
+      {
+        binding: 1,
+        visibility: GPUShaderStage.FRAGMENT,
+        texture: {
+          sampleType: 'unfilterable-float',
+          viewDimension: '2d',
+        },
+      },
+      {
+        binding: 2,
+        visibility: GPUShaderStage.FRAGMENT,
+        texture: {
+          sampleType: 'float',
+          viewDimension: '2d',
+        },
+      },
+      {
+        binding: 3,
+        visibility: GPUShaderStage.FRAGMENT,
+        buffer: {
+          type: 'uniform',
+        },
+      },
+    ],
+    label: 'render_bind_group_layout',
+  });
+
+  const pipelineLayout = gpuDevice.createPipelineLayout({
+    bindGroupLayouts: [renderBindGroupLayout],
+    label: 'render_pipeline_layout',
   });
 
   renderPipeline = gpuDevice.createRenderPipeline({
-    layout: 'auto',
+    layout: pipelineLayout,
     vertex: {
       module: vertexModule,
       entryPoint: 'vs_main',
@@ -825,14 +1018,93 @@ const setupFDTDRenderPipeline = async (fdtdSim: FDTDSimulation, gpuDevice: GPUDe
     primitive: {
       topology: 'triangle-list',
     },
+    label: 'field_render_pipeline',
   });
 
   renderConfigBuffer = gpuDevice.createBuffer({
-    size: 16,
+    size: 16, // 4 floats for vec4
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    label: 'render_config_buffer',
   });
 
   return context;
+};
+
+// Initialize WebGPU with FDTD simulation
+const initializeWebGPUWithFDTD = async () => {
+  if (!navigator.gpu) {
+    throw new Error('WebGPU not supported');
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    throw new Error('WebGPU adapter not found');
+  }
+
+  const device = await adapter.requestDevice({
+    label: 'FDTD Simulation Device',
+    requiredFeatures: [],
+    requiredLimits: {},
+  });
+
+  // Add error event listener for debugging
+  device.addEventListener('uncapturederror', (event) => {
+    console.error('WebGPU uncaptured error:', event.error);
+  });
+
+  const fdtdSim = new FDTDSimulation(device);
+
+  await fdtdSim.initializePipelines();
+  fdtdSim.initializeTextures();
+
+  return { device, fdtdSim };
+};// Update FDTD render function
+const updateFDTDRender = (context: GPUCanvasContext, simulation: FDTDSimulation) => {
+  // Get all required textures
+  const electricFieldTexture = simulation.getTexture('electricField');
+  const magneticFieldTexture = simulation.getTexture('magneticField');
+  const materialTexture = simulation.getTexture('materialField');
+
+  if (!electricFieldTexture || !magneticFieldTexture || !materialTexture) {
+    console.log('Missing required textures for rendering');
+    return;
+  }
+
+  // Config values: brightness, electricEnergyFactor, magneticEnergyFactor, time
+  const configData = new Float32Array([
+    10.0, // brightness - increased for better visibility
+    0.5,  // electricEnergyFactor
+    0.5,  // magneticEnergyFactor
+    simulation.getTime(), // time
+  ]);
+
+  device.queue.writeBuffer(renderConfigBuffer, 0, configData);
+
+  const bindGroup = device.createBindGroup({
+    layout: renderBindGroupLayout,
+    entries: [
+      { binding: 0, resource: electricFieldTexture.createView() },
+      { binding: 1, resource: magneticFieldTexture.createView() },
+      { binding: 2, resource: materialTexture.createView() },
+      { binding: 3, resource: { buffer: renderConfigBuffer } },
+    ],
+    label: 'render_bind_group',
+  }); const commandEncoder = device.createCommandEncoder();
+  const renderPass = commandEncoder.beginRenderPass({
+    colorAttachments: [{
+      view: context.getCurrentTexture().createView(),
+      clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      loadOp: 'clear',
+      storeOp: 'store',
+    }],
+  });
+
+  renderPass.setPipeline(renderPipeline);
+  renderPass.setBindGroup(0, bindGroup);
+  renderPass.draw(6);
+  renderPass.end();
+
+  device.queue.submit([commandEncoder.finish()]);
 };
 
 // Updated initialization - Fixed device scope and error handling
@@ -849,6 +1121,13 @@ const initialize = async () => {
     renderContext = await setupFDTDRenderPipeline(fdtdSimulation, device);
 
     console.log('FDTD simulation ready. Starting render loop...');
+
+    // Add a test charge at startup
+    setTimeout(() => {
+      console.log('Adding test charge...');
+      fdtdSimulation.addPointCharge(0, 0, 1.0);
+    }, 1000);
+
     animate();
 
   } catch (error) {
@@ -863,10 +1142,8 @@ const initialize = async () => {
 };
 
 // Add error handling to animation loop
-const animate = (currentTime: number = performance.now()) => {
+const animate = () => {
   try {
-    requestAnimationFrame(animate);
-
     if (fdtdSimulation && renderContext && device) {
       // Run FDTD simulation step
       fdtdSimulation.step();
@@ -874,13 +1151,69 @@ const animate = (currentTime: number = performance.now()) => {
       // Render the results
       updateFDTDRender(renderContext, fdtdSimulation);
     }
+    requestAnimationFrame(animate);
   } catch (error) {
-    console.error('Animation error:', error);
+    console.error('Animation loop error:', error);
+    // Stop animation loop on error to prevent spam
   }
 };
 
 const ChargeCanvas = () => {
-  return <div style={{ margin: 0, padding: 0, overflow: 'hidden' }} />;
+  React.useEffect(() => {
+    initialize();
+
+    // Add click handler for adding charges
+    const handleClick = (event: MouseEvent) => {
+      if (fdtdSimulation) {
+        const canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement;
+        if (canvas && event.target === canvas) { // Only handle clicks on canvas
+          const rect = canvas.getBoundingClientRect();
+          const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+          const y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
+          console.log(`Adding charge at (${x}, ${y})`); // Debug log
+          fdtdSimulation.addPointCharge(x, y, 1.0);
+        }
+      }
+    };
+
+    // Add to canvas specifically rather than document
+    setTimeout(() => {
+      const canvas = document.getElementById('fdtd-canvas');
+      if (canvas) {
+        canvas.addEventListener('click', handleClick);
+      }
+    }, 1000); // Wait for canvas to be created
+
+    return () => {
+      const canvas = document.getElementById('fdtd-canvas');
+      if (canvas) {
+        canvas.removeEventListener('click', handleClick);
+      }
+      if (fdtdSimulation) {
+        fdtdSimulation.destroy();
+      }
+    };
+  }, []);
+
+  return (
+    <div style={{
+      position: 'relative',
+      width: '100%',
+      height: '100vh',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center'
+    }}>
+      <div style={{
+        color: '#666',
+        fontSize: '14px',
+        position: 'absolute',
+        top: '20px'
+      }}>
+        Click on the canvas to add point charges
+      </div>
+    </div>
+  );
 };
 
 export default ChargeCanvas;
