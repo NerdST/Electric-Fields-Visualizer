@@ -49,27 +49,41 @@ charge1.magnitude = 1e-6;
 let charges: Charge[] = [charge1]; //[charge1, charge2];
 
 // Create charge visualizations
-let chargeMeshes: THREE.Mesh[] = [];
+let chargeMeshes: Map<string, THREE.Mesh> = new Map();
 let selectedChargeId: string | null = null;
 let raycaster = new THREE.Raycaster();
 let mouse = new THREE.Vector2();
 
-// Function to update charge meshes
+// Function to update charge meshes (diff-based: create/update/remove)
 const updateChargeMeshes = () => {
-  // Remove existing meshes
-  chargeMeshes.forEach(mesh => scene.remove(mesh));
-  chargeMeshes = [];
-  
-  // Create new meshes
-  charges.forEach((charge) => {
-    const material = charge.magnitude > 0 ? positiveChargeMaterial : negativeChargeMaterial;
-    const mesh = new THREE.Mesh(chargeGeometry, material);
+  const seen: Set<string> = new Set();
+
+  // Update existing and create missing
+  for (const charge of charges) {
+    seen.add(charge.id);
+    let mesh = chargeMeshes.get(charge.id);
+    const desiredMaterial = charge.magnitude > 0 ? positiveChargeMaterial : negativeChargeMaterial;
+    if (!mesh) {
+      mesh = new THREE.Mesh(chargeGeometry, desiredMaterial);
+      mesh.userData = { chargeId: charge.id };
+      scene.add(mesh);
+      chargeMeshes.set(charge.id, mesh);
+    } else {
+      // If sign changed, swap material
+      const isPositive = mesh.material === positiveChargeMaterial;
+      if ((isPositive && charge.magnitude < 0) || (!isPositive && charge.magnitude > 0)) {
+        mesh.material = desiredMaterial;
+      }
+    }
     mesh.position.copy(charge.position);
-    mesh.userData = { chargeId: charge.id };
-    
-    // Add selection highlight
+
+    // Selection highlight
+    mesh.scale.setScalar(selectedChargeId === charge.id ? 1.5 : 1.0);
+    // Remove any existing outline
+    mesh.children
+      .filter(c => (c as any).isMesh)
+      .forEach(child => mesh && mesh.remove(child));
     if (selectedChargeId === charge.id) {
-      mesh.scale.setScalar(1.5);
       const outlineGeometry = new THREE.SphereGeometry(0.25, 16, 16);
       const outlineMaterial = new THREE.MeshBasicMaterial({ 
         color: 0xffff00, 
@@ -80,10 +94,15 @@ const updateChargeMeshes = () => {
       const outline = new THREE.Mesh(outlineGeometry, outlineMaterial);
       mesh.add(outline);
     }
-    
-    scene.add(mesh);
-    chargeMeshes.push(mesh);
-  });
+  }
+
+  // Remove meshes that no longer have charges
+  for (const [id, mesh] of Array.from(chargeMeshes.entries())) {
+    if (!seen.has(id)) {
+      scene.remove(mesh);
+      chargeMeshes.delete(id);
+    }
+  }
 };
 
 // Initialize charge meshes
@@ -103,6 +122,18 @@ const ThreeWorkspace: React.FC = () => {
   const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
   const [chargeStack, setChargeStack] = useState<string[]>([]);
 
+  // Throttled vector field updates
+  const vfUpdateScheduled = useRef(false);
+  const scheduleVectorFieldUpdate = useCallback((nextCharges: Charge[]) => {
+    if (!vectorFieldRenderer) return;
+    if (vfUpdateScheduled.current) return;
+    vfUpdateScheduled.current = true;
+    requestAnimationFrame(() => {
+      vfUpdateScheduled.current = false;
+      vectorFieldRenderer.updateCharges(nextCharges);
+    });
+  }, [vectorFieldRenderer]);
+
   // Charge management functions
   const addCharge = useCallback(() => {
     const newCharge = createCharge(
@@ -111,7 +142,7 @@ const ThreeWorkspace: React.FC = () => {
         (Math.random() - 0.5) * 10,
         (Math.random() - 0.5) * 10
       ),
-      Math.random() > 0.5 ? 1e-6 : -1e-6, // Random positive or negative
+      Math.random() > 0.5 ? 1e-6 : -1e-6,
       `charge-${Date.now()}`
     );
     
@@ -120,10 +151,7 @@ const ThreeWorkspace: React.FC = () => {
     setChargesState(newCharges);
     setChargeStack(prev => [...prev, newCharge.id]);
     updateChargeMeshes();
-    
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.updateCharges(newCharges);
-    }
+    scheduleVectorFieldUpdate(newCharges);
   }, [chargesState, vectorFieldRenderer]);
 
   const removeCharge = useCallback((chargeId: string) => {
@@ -133,14 +161,10 @@ const ThreeWorkspace: React.FC = () => {
     setSelectedCharge(null);
     selectedChargeId = null;
     
-    // Remove from stack
     setChargeStack(prev => prev.filter(id => id !== chargeId));
     
     updateChargeMeshes();
-    
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.updateCharges(newCharges);
-    }
+    scheduleVectorFieldUpdate(newCharges);
   }, [chargesState, vectorFieldRenderer]);
 
   const removeLastAdded = useCallback(() => {
@@ -157,10 +181,7 @@ const ThreeWorkspace: React.FC = () => {
     setChargeStack([]);
     selectedChargeId = null;
     updateChargeMeshes();
-    
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.updateCharges([]);
-    }
+    scheduleVectorFieldUpdate([]);
   }, [vectorFieldRenderer]);
 
   const selectCharge = useCallback((chargeId: string) => {
@@ -179,10 +200,7 @@ const ThreeWorkspace: React.FC = () => {
     charges = newCharges;
     setChargesState(newCharges);
     updateChargeMeshes();
-    
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.updateCharges(newCharges);
-    }
+    scheduleVectorFieldUpdate(newCharges);
   }, [chargesState, vectorFieldRenderer]);
 
   const updateChargePosition = useCallback((chargeId: string, position: THREE.Vector3) => {
@@ -192,13 +210,9 @@ const ThreeWorkspace: React.FC = () => {
     charges = newCharges;
     setChargesState(newCharges);
     updateChargeMeshes();
-    
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.updateCharges(newCharges);
-    }
+    scheduleVectorFieldUpdate(newCharges);
   }, [chargesState, vectorFieldRenderer]);
 
-  // Mouse interaction for charge selection
   const handleMouseClick = useCallback((event: MouseEvent) => {
     if (!controls) return;
     
@@ -207,7 +221,7 @@ const ThreeWorkspace: React.FC = () => {
     mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     
     raycaster.setFromCamera(mouse, camera);
-    const intersects = raycaster.intersectObjects(chargeMeshes);
+    const intersects = raycaster.intersectObjects(Array.from(chargeMeshes.values()));
     
     if (intersects.length > 0) {
       const clickedChargeId = intersects[0].object.userData.chargeId;
