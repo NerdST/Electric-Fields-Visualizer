@@ -17,6 +17,8 @@ export class VectorFieldRenderer {
   private arrowMaterial: THREE.MeshBasicMaterial;
   private config: VectorFieldConfig;
   private charges: Charge[] = [];
+  private gridPoints: THREE.Vector3[] = [];
+  private readonly upVector: THREE.Vector3 = new THREE.Vector3(0, 1, 0);
 
   constructor(scene: THREE.Scene, config: VectorFieldConfig) {
     this.scene = scene;
@@ -38,8 +40,8 @@ export class VectorFieldRenderer {
       this.arrowMesh.dispose();
     }
 
-    const gridPoints = this.generateGridPoints();
-    const instanceCount = gridPoints.length;
+    this.gridPoints = this.generateGridPoints();
+    const instanceCount = this.gridPoints.length;
     
     if (instanceCount === 0) return;
 
@@ -76,8 +78,7 @@ export class VectorFieldRenderer {
 
   private updateVectorField() {
     if (!this.arrowMesh) return;
-
-    const gridPoints = this.generateGridPoints();
+    const gridPoints = this.gridPoints;
     const matrix = new THREE.Matrix4();
     const position = new THREE.Vector3();
     const scale = new THREE.Vector3();
@@ -112,9 +113,8 @@ export class VectorFieldRenderer {
       scale.set(1, arrowLength, 1);
       
       // Rotation to align with field direction
-      const up = new THREE.Vector3(0, 1, 0);
       const direction = field.clone().normalize();
-      quaternion.setFromUnitVectors(up, direction);
+      quaternion.setFromUnitVectors(this.upVector, direction);
 
       matrix.compose(position, quaternion, scale);
       this.arrowMesh.setMatrixAt(i, matrix);
@@ -129,8 +129,18 @@ export class VectorFieldRenderer {
   }
 
   public updateConfig(config: Partial<VectorFieldConfig>) {
-    this.config = { ...this.config, ...config };
-    this.createVectorField();
+    const nextConfig = { ...this.config, ...config };
+    const oldGridPoints = this.gridPoints;
+    const oldCount = oldGridPoints.length;
+    this.config = nextConfig;
+    // Recompute grid points and only recreate mesh if instance count changed
+    this.gridPoints = this.generateGridPoints();
+    const newCount = this.gridPoints.length;
+    if (newCount !== oldCount || !this.arrowMesh) {
+      this.createVectorField();
+    } else {
+      this.updateVectorField();
+    }
   }
 
   public setVisible(visible: boolean) {
