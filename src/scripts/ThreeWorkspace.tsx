@@ -122,7 +122,6 @@ const ThreeWorkspace: React.FC = () => {
   const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
   const [chargeStack, setChargeStack] = useState<string[]>([]);
 
-  // Throttled vector field updates
   const vfUpdateScheduled = useRef(false);
   const scheduleVectorFieldUpdate = useCallback((nextCharges: Charge[]) => {
     if (!vectorFieldRenderer) return;
