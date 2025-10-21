@@ -121,6 +121,7 @@ const ThreeWorkspace: React.FC = () => {
   const [chargesState, setChargesState] = useState<Charge[]>(charges);
   const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
   const [chargeStack, setChargeStack] = useState<string[]>([]);
+  const vectorFieldInitialized = useRef(false);
 
   const vfUpdateScheduled = useRef(false);
   const scheduleVectorFieldUpdate = useCallback((nextCharges: Charge[]) => {
@@ -246,11 +247,14 @@ const ThreeWorkspace: React.FC = () => {
     controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
 
-    // Initialize vector field renderer
-    const vectorFieldConfig = createDefaultVectorFieldConfig();
-    const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
-    vfRenderer.updateCharges(charges);
-    setVectorFieldRenderer(vfRenderer);
+    // Initialize vector field renderer (only if not already created)
+    if (!vectorFieldInitialized.current) {
+      const vectorFieldConfig = createDefaultVectorFieldConfig();
+      const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
+      vfRenderer.updateCharges(charges);
+      setVectorFieldRenderer(vfRenderer);
+      vectorFieldInitialized.current = true;
+    }
 
     const onResize = () => {
       const width = container.clientWidth || window.innerWidth;
@@ -276,13 +280,19 @@ const ThreeWorkspace: React.FC = () => {
         vectorFieldRenderer.dispose();
       }
     };
-  }, [handleMouseClick]);
+  }, []);
 
   const toggleVectorField = () => {
     const newVisibility = !showVectorField;
+    console.log('Toggling vector field visibility to:', newVisibility);
+    console.log('Scene children count:', scene.children.length);
+    console.log('Scene children:', scene.children.map(child => child.type));
     setShowVectorField(newVisibility);
     if (vectorFieldRenderer) {
+      console.log('Setting vector field renderer visibility to:', newVisibility);
       vectorFieldRenderer.setVisible(newVisibility);
+    } else {
+      console.log('Vector field renderer is null!');
     }
   };
 

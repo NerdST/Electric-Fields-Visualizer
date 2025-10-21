@@ -139,8 +139,12 @@ export class VectorFieldRenderer {
   }
 
   public setVisible(visible: boolean) {
+    console.log('VectorFieldRenderer.setVisible called with:', visible);
     if (this.arrowMesh) {
+      console.log('Setting arrowMesh.visible to:', visible);
       this.arrowMesh.visible = visible;
+    } else {
+      console.log('arrowMesh is null!');
     }
   }
 
