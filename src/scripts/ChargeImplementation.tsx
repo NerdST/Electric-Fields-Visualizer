@@ -33,10 +33,13 @@ const updateAlphaBeta = `
     let coord = vec2<i32>(gid.xy);
     let mat = textureLoad(materialTex, coord, 0).rgb;
     
-    // Scale normalized values back to physical constants
-    let permeability = 4.0 * 3.14159 * 1e-7; // μ₀ (vacuum permeability)
-    let permittivity = 8.854187817e-12; // ε₀ (vacuum permittivity)
-    let conductivity = 0.0; // σ (no conductivity for vacuum)
+    // Material texture stores normalized [0,1] values in rgba8unorm format
+    // permeability is in x (red), permittivity is in y (green), conductivity is in z (blue)
+    // For vacuum: permeability ≈ 1.0, permittivity ≈ 1.0, conductivity = 0
+    // The texture values are stored as normalized, so we use them directly
+    let permeability = mat.x;
+    let permittivity = mat.y;
+    let conductivity = mat.z;
 
     let cEl = conductivity * sim.dt / (2.0 * permeability);
     let dEl = 1.0 / (1.0 + cEl);
@@ -409,44 +412,39 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let electricEnergyFactor = config.y;
   let magneticEnergyFactor = config.z;
   
-  // Scale material values from [0,1] range back to physical values
-  // Material texture stores normalized values that need to be scaled back
-  let permittivity = (material.x - 0.5) * 8.0 + 1.0; // Scale around 1.0
-  let permeability = (material.y - 0.5) * 8.0 + 1.0; // Scale around 1.0
+  // Material is stored as normalized [0,1] in rgba8unorm texture
+  // permeability is in x (red), permittivity is in y (green), conductivity is in z (blue)
+  let permeability = material.x;
+  let permittivity = material.y;
+  let conductivity = material.z;
   
-  // Calculate energy densities (simplified from reference)
+  // Calculate energy densities separately (matching reference renderEnergy shader)
+  // Store in separate channels: R = electric energy, G = magnetic energy
+  let brightnessSquared = brightness * brightness;
   let electricEnergy = electricEnergyFactor * permittivity * dot(electricField, electricField);
   let magneticEnergy = magneticEnergyFactor * permeability * dot(magneticField, magneticField);
   
-  // Apply brightness scaling
-  let brightnessSquared = brightness * brightness;
-  let totalEnergy = brightnessSquared * (electricEnergy + magneticEnergy);
+  let scaledElectricEnergy = brightnessSquared * electricEnergy;
+  let scaledMagneticEnergy = brightnessSquared * magneticEnergy;
   
-  // Simple bloom-like effect - extract bright areas
+  // Simple bloom effect - extract bright areas (matching reference bloomExtract)
   let bloomThreshold = 0.1;
-  let bloomValue = step(bloomThreshold, totalEnergy) * totalEnergy * 0.5;
+  let avgEnergy = 0.5 * (scaledElectricEnergy + scaledMagneticEnergy);
+  let bloomAmount = step(bloomThreshold, avgEnergy);
+  let bloomElectric = scaledElectricEnergy * bloomAmount * 0.3;
+  let bloomMagnetic = scaledMagneticEnergy * bloomAmount * 0.3;
   
-  // Final color combining energy and bloom
-  let finalIntensity = clamp(totalEnergy + bloomValue, 0.0, 1.0);
+  // Combine base energy with bloom (matching reference draw shader logic)
+  let finalElectric = min(1.0, scaledElectricEnergy + bloomElectric + bloomMagnetic * 0.5);
+  let finalMagnetic = min(1.0, scaledMagneticEnergy + bloomMagnetic + bloomElectric * 0.5);
   
-  // Color mapping: black -> blue -> cyan -> yellow -> white
-  var color = vec3<f32>(0.0, 0.0, 0.0);
-  if (finalIntensity > 0.001) {
-    if (finalIntensity < 0.25) {
-      // Black to blue
-      color = vec3<f32>(0.0, 0.0, finalIntensity * 4.0);
-    } else if (finalIntensity < 0.5) {
-      // Blue to cyan
-      color = vec3<f32>(0.0, (finalIntensity - 0.25) * 4.0, 1.0);
-    } else if (finalIntensity < 0.75) {
-      // Cyan to yellow
-      color = vec3<f32>((finalIntensity - 0.5) * 4.0, 1.0, 1.0 - (finalIntensity - 0.5) * 4.0);
-    } else {
-      // Yellow to white
-      let whiteAmount = (finalIntensity - 0.75) * 4.0;
-      color = vec3<f32>(1.0, 1.0, whiteAmount);
-    }
-  }
+  // Color mapping (matching reference: red=electric, blue=magnetic, green=bloom)
+  // This creates the gradient effect with proper color separation
+  let color = vec3<f32>(
+    finalElectric,           // Red channel: electric energy
+    bloomElectric + bloomMagnetic,  // Green channel: bloom (yellow when both present)
+    finalMagnetic            // Blue channel: magnetic energy
+  );
   
   return vec4<f32>(color, 1.0);
 }`;
@@ -544,12 +542,13 @@ class FDTDSimulation {
 
   private initializeMaterialField() {
     // Initialize with vacuum properties
-    // For rgba8unorm, we need to normalize values to [0,1] and scale in shader
+    // For rgba8unorm, values are automatically normalized to [0,1]
+    // Vacuum: permeability ≈ 1.0, permittivity ≈ 1.0, conductivity = 0
     const materialData = new Uint8Array(this.textureSize * this.textureSize * 4);
     for (let i = 0; i < materialData.length; i += 4) {
-      materialData[i] = 128; // permeability - neutral value, will scale in shader
-      materialData[i + 1] = 128; // permittivity - neutral value, will scale in shader  
-      materialData[i + 2] = 0; // conductivity (σ)
+      materialData[i] = 255; // permeability = 1.0 (vacuum)
+      materialData[i + 1] = 255; // permittivity = 1.0 (vacuum)
+      materialData[i + 2] = 0; // conductivity = 0 (no loss)
       materialData[i + 3] = 255; // unused - full alpha
     }
 
@@ -610,8 +609,8 @@ class FDTDSimulation {
 
     const drawParams = new Float32Array([
       nx, ny, // position in [0,1] space
-      0.1, 0.1, // slightly larger radius for visibility
-      0, 0, charge * 10, 0, // much larger charge magnitude for debugging
+      0.05, 0.05, // smaller radius for point source
+      0, 0, charge * 1.0, 0, // reduced charge magnitude for smoother propagation
       1, 1, 1, 1, // keep existing values (additive)
     ]);
 
@@ -1071,8 +1070,13 @@ const updateFDTDRender = (context: GPUCanvasContext, simulation: FDTDSimulation)
   }
 
   // Config values: brightness, electricEnergyFactor, magneticEnergyFactor, time
+  // Reference uses: brightness = 0.02 * 0.02 / (cellSize * cellSize)
+  const cellSize = 0.01; // Match simulation cellSize
+  const brightnessBase = 0.02;
+  const brightness = (brightnessBase * brightnessBase) / (cellSize * cellSize);
+
   const configData = new Float32Array([
-    3.0, // brightness - adjusted for better visibility without artifacts
+    brightness, // brightness calculated from cellSize
     0.5,  // electricEnergyFactor
     0.5,  // magneticEnergyFactor
     simulation.getTime(), // time
@@ -1110,6 +1114,11 @@ const updateFDTDRender = (context: GPUCanvasContext, simulation: FDTDSimulation)
 // Simulation state
 let simulationSpeed = 60; // Steps per second
 let simulationTimer: number | null = null;
+let mouseIsDown = false;
+let mouseDownPosition: [number, number] | null = null;
+const signalFrequency = 3; // Hz
+const signalBrushValue = 10; // Amplitude
+const signalBrushSize = 1; // Grid cells
 
 // Updated initialization - Fixed device scope and error handling
 const initialize = async () => {
@@ -1125,12 +1134,6 @@ const initialize = async () => {
     renderContext = await setupFDTDRenderPipeline(fdtdSimulation, device);
 
     console.log('FDTD simulation ready. Starting loops...');
-
-    // Add a test charge at startup
-    setTimeout(() => {
-      console.log('Adding test charge...');
-      fdtdSimulation.addPointCharge(0, 0, 1.0);
-    }, 1000);
 
     // Start separate simulation and render loops
     startSimulationLoop();
@@ -1156,6 +1159,22 @@ const startSimulationLoop = () => {
   const simStep = () => {
     try {
       if (fdtdSimulation) {
+        // Inject oscillating source if mouse is down (matching reference behavior)
+        if (mouseIsDown && mouseDownPosition) {
+          const gridSize = 512; // Match textureSize
+          const brushHalfSize: [number, number] = [
+            signalBrushSize / gridSize / 2,
+            signalBrushSize / gridSize / 2
+          ];
+
+          // Oscillating source matching reference: -signalBrushValue * 2000 * cos(2π * freq * time)
+          const time = fdtdSimulation.getTime();
+          const value = -signalBrushValue * 2000 * Math.cos(2 * Math.PI * signalFrequency * time);
+
+          // Inject into source field
+          injectOscillatingSource(mouseDownPosition, brushHalfSize, value);
+        }
+
         fdtdSimulation.step();
       }
     } catch (error) {
@@ -1167,7 +1186,50 @@ const startSimulationLoop = () => {
   simulationTimer = window.setInterval(simStep, 1000 / simulationSpeed);
 };
 
-// Separate render loop (runs every frame)
+// Helper function to inject oscillating source
+const injectOscillatingSource = (center: [number, number], halfSize: [number, number], value: number) => {
+  const drawParams = new Float32Array([
+    center[0], center[1], // position in [0,1] space
+    halfSize[0], halfSize[1], // half size
+    0, 0, value, 0, // z-component value (electromagnetic wave)
+    1, 1, 1, 1, // keep existing values (additive)
+  ]);
+
+  const paramsBuffer = device.createBuffer({
+    size: 64,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(paramsBuffer, 0, drawParams);
+
+  const tempTexture = device.createTexture({
+    size: [512, 512],
+    format: 'rgba32float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+  });
+
+  const bindGroup = device.createBindGroup({
+    layout: fdtdSimulation.getPipeline('drawSquare')!.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: fdtdSimulation.getTexture('sourceField')!.createView() },
+      { binding: 1, resource: { buffer: paramsBuffer } },
+      { binding: 2, resource: tempTexture.createView() },
+    ],
+  });
+
+  fdtdSimulation.runComputePass('drawSquare', bindGroup, Math.ceil(512 / 8), Math.ceil(512 / 8));
+
+  // Copy result back
+  const commandEncoder = device.createCommandEncoder();
+  commandEncoder.copyTextureToTexture(
+    { texture: tempTexture },
+    { texture: fdtdSimulation.getTexture('sourceField')! },
+    [512, 512]
+  );
+  device.queue.submit([commandEncoder.finish()]);
+
+  tempTexture.destroy();
+  paramsBuffer.destroy();
+};// Separate render loop (runs every frame)
 const startRenderLoop = () => {
   const render = () => {
     try {
@@ -1187,32 +1249,58 @@ const ChargeCanvas = () => {
   React.useEffect(() => {
     initialize();
 
-    // Add click handler for adding charges
-    const handleClick = (event: MouseEvent) => {
+    // Add mouse handlers for continuous source injection (matching reference)
+    const handleMouseDown = (event: MouseEvent) => {
       if (fdtdSimulation) {
         const canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement;
-        if (canvas && event.target === canvas) { // Only handle clicks on canvas
+        if (canvas && event.target === canvas) {
           const rect = canvas.getBoundingClientRect();
-          const x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-          const y = -(((event.clientY - rect.top) / rect.height) * 2 - 1);
-          console.log(`Adding charge at (${x}, ${y})`); // Debug log
-          fdtdSimulation.addPointCharge(x, y, 1.0);
+          const x = (event.clientX - rect.left) / rect.width; // [0, 1]
+          const y = 1 - ((event.clientY - rect.top) / rect.height); // [0, 1] with y-flip
+          mouseDownPosition = [x, y];
+          mouseIsDown = true;
+          console.log(`Mouse down at (${x}, ${y})`);
         }
       }
     };
 
-    // Add to canvas specifically rather than document
+    const handleMouseUp = () => {
+      mouseIsDown = false;
+      mouseDownPosition = null;
+      console.log('Mouse up');
+    };
+
+    const handleMouseMove = (event: MouseEvent) => {
+      if (mouseIsDown && fdtdSimulation) {
+        const canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement;
+        if (canvas) {
+          const rect = canvas.getBoundingClientRect();
+          const x = (event.clientX - rect.left) / rect.width;
+          const y = 1 - ((event.clientY - rect.top) / rect.height);
+          mouseDownPosition = [x, y];
+        }
+      }
+    };
+
+    // Add event listeners after canvas is created
     setTimeout(() => {
       const canvas = document.getElementById('fdtd-canvas');
       if (canvas) {
-        canvas.addEventListener('click', handleClick);
+        canvas.addEventListener('mousedown', handleMouseDown);
+        canvas.addEventListener('mouseup', handleMouseUp);
+        canvas.addEventListener('mousemove', handleMouseMove);
+        // Also handle mouse leaving canvas
+        canvas.addEventListener('mouseleave', handleMouseUp);
       }
-    }, 1000); // Wait for canvas to be created
+    }, 1000);
 
     return () => {
       const canvas = document.getElementById('fdtd-canvas');
       if (canvas) {
-        canvas.removeEventListener('click', handleClick);
+        canvas.removeEventListener('mousedown', handleMouseDown);
+        canvas.removeEventListener('mouseup', handleMouseUp);
+        canvas.removeEventListener('mousemove', handleMouseMove);
+        canvas.removeEventListener('mouseleave', handleMouseUp);
       }
       if (simulationTimer) {
         clearInterval(simulationTimer);
@@ -1238,7 +1326,7 @@ const ChargeCanvas = () => {
         position: 'absolute',
         top: '20px'
       }}>
-        Click on the canvas to add point charges
+        Click and hold to create oscillating electromagnetic waves
       </div>
     </div>
   );
