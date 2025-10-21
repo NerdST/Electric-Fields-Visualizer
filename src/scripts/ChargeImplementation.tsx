@@ -611,7 +611,7 @@ class FDTDSimulation {
     const drawParams = new Float32Array([
       nx, ny, // position in [0,1] space
       0.1, 0.1, // slightly larger radius for visibility
-      0, 0, charge * 1000, 0, // much larger charge magnitude for debugging
+      0, 0, charge * 10, 0, // much larger charge magnitude for debugging
       1, 1, 1, 1, // keep existing values (additive)
     ]);
 
@@ -1072,7 +1072,7 @@ const updateFDTDRender = (context: GPUCanvasContext, simulation: FDTDSimulation)
 
   // Config values: brightness, electricEnergyFactor, magneticEnergyFactor, time
   const configData = new Float32Array([
-    10.0, // brightness - increased for better visibility
+    3.0, // brightness - adjusted for better visibility without artifacts
     0.5,  // electricEnergyFactor
     0.5,  // magneticEnergyFactor
     simulation.getTime(), // time
@@ -1107,6 +1107,10 @@ const updateFDTDRender = (context: GPUCanvasContext, simulation: FDTDSimulation)
   device.queue.submit([commandEncoder.finish()]);
 };
 
+// Simulation state
+let simulationSpeed = 60; // Steps per second
+let simulationTimer: number | null = null;
+
 // Updated initialization - Fixed device scope and error handling
 const initialize = async () => {
   try {
@@ -1120,7 +1124,7 @@ const initialize = async () => {
     // Setup render pipeline for FDTD - pass device explicitly
     renderContext = await setupFDTDRenderPipeline(fdtdSimulation, device);
 
-    console.log('FDTD simulation ready. Starting render loop...');
+    console.log('FDTD simulation ready. Starting loops...');
 
     // Add a test charge at startup
     setTimeout(() => {
@@ -1128,7 +1132,9 @@ const initialize = async () => {
       fdtdSimulation.addPointCharge(0, 0, 1.0);
     }, 1000);
 
-    animate();
+    // Start separate simulation and render loops
+    startSimulationLoop();
+    startRenderLoop();
 
   } catch (error) {
     console.error('Error initializing:', error);
@@ -1141,21 +1147,40 @@ const initialize = async () => {
   }
 };
 
-// Add error handling to animation loop
-const animate = () => {
-  try {
-    if (fdtdSimulation && renderContext && device) {
-      // Run FDTD simulation step
-      fdtdSimulation.step();
-
-      // Render the results
-      updateFDTDRender(renderContext, fdtdSimulation);
-    }
-    requestAnimationFrame(animate);
-  } catch (error) {
-    console.error('Animation loop error:', error);
-    // Stop animation loop on error to prevent spam
+// Separate simulation loop (fixed timestep)
+const startSimulationLoop = () => {
+  if (simulationTimer) {
+    clearInterval(simulationTimer);
   }
+
+  const simStep = () => {
+    try {
+      if (fdtdSimulation) {
+        fdtdSimulation.step();
+      }
+    } catch (error) {
+      console.error('Simulation step error:', error);
+    }
+  };
+
+  // Run simulation at fixed rate
+  simulationTimer = window.setInterval(simStep, 1000 / simulationSpeed);
+};
+
+// Separate render loop (runs every frame)
+const startRenderLoop = () => {
+  const render = () => {
+    try {
+      if (fdtdSimulation && renderContext && device) {
+        updateFDTDRender(renderContext, fdtdSimulation);
+      }
+      requestAnimationFrame(render);
+    } catch (error) {
+      console.error('Render loop error:', error);
+    }
+  };
+
+  requestAnimationFrame(render);
 };
 
 const ChargeCanvas = () => {
@@ -1188,6 +1213,9 @@ const ChargeCanvas = () => {
       const canvas = document.getElementById('fdtd-canvas');
       if (canvas) {
         canvas.removeEventListener('click', handleClick);
+      }
+      if (simulationTimer) {
+        clearInterval(simulationTimer);
       }
       if (fdtdSimulation) {
         fdtdSimulation.destroy();
