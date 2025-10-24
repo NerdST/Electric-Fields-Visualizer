@@ -5,6 +5,8 @@ import { WebGPURenderer } from 'three/webgpu';
 import { createDefaultCharge, createCharge } from '../physics/Charge';
 import type { Charge } from '../physics/Charge';
 import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../visualization/VectorField';
+import { createVoltagePoint } from '../physics/VoltagePoint';
+import type { VoltagePoint } from '../physics/VoltagePoint';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -54,11 +56,18 @@ let selectedChargeId: string | null = null;
 let raycaster = new THREE.Raycaster();
 let mouse = new THREE.Vector2();
 
-// Function to update charge meshes (diff-based: create/update/remove)
+// Voltage point visualizations
+let voltagePointMeshes: Map<string, THREE.Mesh> = new Map();
+const voltagePointGeometry = new THREE.SphereGeometry(0.15, 12, 12);
+const voltagePointMaterial = new THREE.MeshBasicMaterial({ 
+  color: 0x00ff00, 
+  transparent: true, 
+  opacity: 0.8 
+});
+
 const updateChargeMeshes = () => {
   const seen: Set<string> = new Set();
 
-  // Update existing and create missing
   for (const charge of charges) {
     seen.add(charge.id);
     let mesh = chargeMeshes.get(charge.id);
@@ -96,11 +105,36 @@ const updateChargeMeshes = () => {
     }
   }
 
-  // Remove meshes that no longer have charges
   for (const [id, mesh] of Array.from(chargeMeshes.entries())) {
     if (!seen.has(id)) {
       scene.remove(mesh);
       chargeMeshes.delete(id);
+    }
+  }
+};
+
+// Function to update voltage point meshes
+const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
+  const seen: Set<string> = new Set();
+
+  // Update existing and create missing
+  for (const point of voltagePoints) {
+    seen.add(point.id);
+    let mesh = voltagePointMeshes.get(point.id);
+    if (!mesh) {
+      mesh = new THREE.Mesh(voltagePointGeometry, voltagePointMaterial);
+      mesh.userData = { voltagePointId: point.id };
+      scene.add(mesh);
+      voltagePointMeshes.set(point.id, mesh);
+    }
+    mesh.position.copy(point.position);
+  }
+
+  // Remove meshes that no longer have voltage points
+  for (const [id, mesh] of Array.from(voltagePointMeshes.entries())) {
+    if (!seen.has(id)) {
+      scene.remove(mesh);
+      voltagePointMeshes.delete(id);
     }
   }
 };
@@ -121,6 +155,14 @@ const ThreeWorkspace: React.FC = () => {
   const [chargesState, setChargesState] = useState<Charge[]>(charges);
   const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
   const [chargeStack, setChargeStack] = useState<string[]>([]);
+  const [voltagePoints, setVoltagePoints] = useState<VoltagePoint[]>([]);
+  const [showVoltagePointUI, setShowVoltagePointUI] = useState(false);
+  const [newVoltagePoint, setNewVoltagePoint] = useState({
+    x: 0,
+    y: 0,
+    z: 0,
+    voltage: 0
+  });
   const vectorFieldInitialized = useRef(false);
 
   const vfUpdateScheduled = useRef(false);
@@ -213,6 +255,26 @@ const ThreeWorkspace: React.FC = () => {
     scheduleVectorFieldUpdate(newCharges);
   }, [chargesState, vectorFieldRenderer]);
 
+  // Voltage point management functions
+  const addVoltagePoint = useCallback(() => {
+    const position = new THREE.Vector3(newVoltagePoint.x, newVoltagePoint.y, newVoltagePoint.z);
+    const newPoint = createVoltagePoint(position, newVoltagePoint.voltage);
+    setVoltagePoints(prev => [...prev, newPoint]);
+    updateVoltagePointMeshes([...voltagePoints, newPoint]);
+    setShowVoltagePointUI(false);
+  }, [voltagePoints, newVoltagePoint]);
+
+  const removeVoltagePoint = useCallback((pointId: string) => {
+    const newPoints = voltagePoints.filter(point => point.id !== pointId);
+    setVoltagePoints(newPoints);
+    updateVoltagePointMeshes(newPoints);
+  }, [voltagePoints]);
+
+  const removeAllVoltagePoints = useCallback(() => {
+    setVoltagePoints([]);
+    updateVoltagePointMeshes([]);
+  }, []);
+
   const handleMouseClick = useCallback((event: MouseEvent) => {
     if (!controls) return;
     
@@ -221,12 +283,18 @@ const ThreeWorkspace: React.FC = () => {
     mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     
     raycaster.setFromCamera(mouse, camera);
-    const intersects = raycaster.intersectObjects(Array.from(chargeMeshes.values()));
+    const chargeIntersects = raycaster.intersectObjects(Array.from(chargeMeshes.values()));
+    const voltageIntersects = raycaster.intersectObjects(Array.from(voltagePointMeshes.values()));
     
-    if (intersects.length > 0) {
-      const clickedChargeId = intersects[0].object.userData.chargeId;
+    if (chargeIntersects.length > 0) {
+      const clickedChargeId = chargeIntersects[0].object.userData.chargeId;
       selectCharge(clickedChargeId);
+    } else if (voltageIntersects.length > 0) {
+      // Handle voltage point selection if needed
+      console.log('Voltage point clicked:', voltageIntersects[0].object.userData.voltagePointId);
     } else {
+      // Clicked on empty space - show voltage point UI
+      setShowVoltagePointUI(true);
       setSelectedCharge(null);
       selectedChargeId = null;
       updateChargeMeshes();
@@ -281,6 +349,11 @@ const ThreeWorkspace: React.FC = () => {
       }
     };
   }, []);
+
+  // Update voltage point meshes when voltage points change
+  useEffect(() => {
+    updateVoltagePointMeshes(voltagePoints);
+  }, [voltagePoints]);
 
   const toggleVectorField = () => {
     const newVisibility = !showVectorField;
@@ -493,6 +566,207 @@ const ThreeWorkspace: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Voltage Point UI - Top Right */}
+      {showVoltagePointUI && (
+        <div style={{
+          position: 'absolute',
+          top: '10px',
+          right: '10px',
+          background: 'rgba(0, 0, 0, 0.8)',
+          color: 'white',
+          padding: '15px',
+          borderRadius: '8px',
+          fontFamily: 'monospace',
+          fontSize: '12px',
+          minWidth: '250px'
+        }}>
+          <div style={{ fontSize: '14px', fontWeight: 'bold', marginBottom: '10px' }}>
+            Add Voltage Measurement Point
+          </div>
+          
+          <div style={{ marginBottom: '8px' }}>
+            <label style={{ display: 'block', marginBottom: '2px' }}>Position X:</label>
+            <input
+              type="number"
+              value={newVoltagePoint.x}
+              onChange={(e) => setNewVoltagePoint(prev => ({ ...prev, x: parseFloat(e.target.value) || 0 }))}
+              style={{
+                width: '100%',
+                padding: '4px',
+                borderRadius: '3px',
+                border: '1px solid #555',
+                background: 'rgba(255, 255, 255, 0.1)',
+                color: 'white',
+                fontSize: '11px'
+              }}
+            />
+          </div>
+
+          <div style={{ marginBottom: '8px' }}>
+            <label style={{ display: 'block', marginBottom: '2px' }}>Position Y:</label>
+            <input
+              type="number"
+              value={newVoltagePoint.y}
+              onChange={(e) => setNewVoltagePoint(prev => ({ ...prev, y: parseFloat(e.target.value) || 0 }))}
+              style={{
+                width: '100%',
+                padding: '4px',
+                borderRadius: '3px',
+                border: '1px solid #555',
+                background: 'rgba(255, 255, 255, 0.1)',
+                color: 'white',
+                fontSize: '11px'
+              }}
+            />
+          </div>
+
+          <div style={{ marginBottom: '10px' }}>
+            <label style={{ display: 'block', marginBottom: '2px' }}>Position Z:</label>
+            <input
+              type="number"
+              value={newVoltagePoint.z}
+              onChange={(e) => setNewVoltagePoint(prev => ({ ...prev, z: parseFloat(e.target.value) || 0 }))}
+              style={{
+                width: '100%',
+                padding: '4px',
+                borderRadius: '3px',
+                border: '1px solid #555',
+                background: 'rgba(255, 255, 255, 0.1)',
+                color: 'white',
+                fontSize: '11px'
+              }}
+            />
+          </div>
+
+          <div style={{ marginBottom: '10px' }}>
+            <label style={{ display: 'block', marginBottom: '2px' }}>Voltage (V):</label>
+            <input
+              type="number"
+              value={newVoltagePoint.voltage}
+              onChange={(e) => setNewVoltagePoint(prev => ({ ...prev, voltage: parseFloat(e.target.value) || 0 }))}
+              style={{
+                width: '100%',
+                padding: '4px',
+                borderRadius: '3px',
+                border: '1px solid #555',
+                background: 'rgba(255, 255, 255, 0.1)',
+                color: 'white',
+                fontSize: '11px'
+              }}
+            />
+          </div>
+
+          <div style={{ display: 'flex', gap: '5px' }}>
+            <button 
+              onClick={addVoltagePoint}
+              style={{
+                padding: '8px 12px',
+                background: '#4CAF50',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '11px',
+                flex: 1
+              }}
+            >
+              Add Point
+            </button>
+            
+            <button 
+              onClick={() => setShowVoltagePointUI(false)}
+              style={{
+                padding: '8px 12px',
+                background: '#f44336',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '11px',
+                flex: 1
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Voltage Points List - Bottom Right */}
+      {voltagePoints.length > 0 && (
+        <div style={{
+          position: 'absolute',
+          bottom: '10px',
+          right: '10px',
+          background: 'rgba(0, 0, 0, 0.8)',
+          color: 'white',
+          padding: '15px',
+          borderRadius: '8px',
+          fontFamily: 'monospace',
+          fontSize: '12px',
+          minWidth: '300px',
+          maxHeight: '300px',
+          overflowY: 'auto'
+        }}>
+          <div style={{ fontSize: '14px', fontWeight: 'bold', marginBottom: '10px' }}>
+            Voltage Points ({voltagePoints.length})
+          </div>
+          
+          {voltagePoints.map((point, index) => (
+            <div key={point.id} style={{
+              border: '1px solid #555',
+              padding: '8px',
+              marginBottom: '5px',
+              borderRadius: '4px',
+              backgroundColor: 'rgba(255, 255, 255, 0.1)'
+            }}>
+              <div style={{ fontWeight: 'bold', marginBottom: '4px' }}>
+                Point {index + 1}
+              </div>
+              <div style={{ fontSize: '10px', marginBottom: '2px' }}>
+                Position: ({point.position.x.toFixed(2)}, {point.position.y.toFixed(2)}, {point.position.z.toFixed(2)})
+              </div>
+              <div style={{ fontSize: '10px', marginBottom: '4px' }}>
+                Voltage: {point.voltage} V
+              </div>
+              <button 
+                onClick={() => removeVoltagePoint(point.id)}
+                style={{
+                  padding: '4px 8px',
+                  background: '#f44336',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '3px',
+                  cursor: 'pointer',
+                  fontSize: '10px'
+                }}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+          
+          {voltagePoints.length > 0 && (
+            <button 
+              onClick={removeAllVoltagePoints}
+              style={{
+                padding: '8px 12px',
+                background: '#ff6b6b',
+                color: 'white',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                fontSize: '11px',
+                width: '100%',
+                marginTop: '10px'
+              }}
+            >
+              🗑️ Remove All
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 };
