@@ -468,6 +468,10 @@ class FDTDSimulation {
     this.initializeSampler();
   }
 
+  public getTextureSize(): number {
+    return this.textureSize;
+  }
+
   private initializeSampler() {
     this.sampler = this.device.createSampler({
       magFilter: 'linear',
@@ -923,14 +927,14 @@ class FDTDSimulation {
 }
 
 // Setup render pipeline for FDTD - Fixed device access issue
-const setupFDTDRenderPipeline = async (_fdtdSim: FDTDSimulation, gpuDevice: GPUDevice) => {
+const setupFDTDRenderPipeline = async (_fdtdSim: FDTDSimulation, gpuDevice: GPUDevice, textureSize: number) => {
   // Get or create the canvas element
   let canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement | null;
   if (!canvas) {
     canvas = document.createElement('canvas');
     canvas.id = 'fdtd-canvas';
-    canvas.width = 512;
-    canvas.height = 512;
+    canvas.width = textureSize;
+    canvas.height = textureSize;
     // Fix canvas styling
     canvas.style.position = 'fixed';
     canvas.style.top = '50%';
@@ -1051,7 +1055,7 @@ const initializeWebGPUWithFDTD = async () => {
     console.error('WebGPU uncaptured error:', event.error);
   });
 
-  const fdtdSim = new FDTDSimulation(device);
+  const fdtdSim = new FDTDSimulation(device, 128);
 
   await fdtdSim.initializePipelines();
   fdtdSim.initializeTextures();
@@ -1131,7 +1135,7 @@ const initialize = async () => {
     console.log('WebGPU and FDTD initialized successfully');
 
     // Setup render pipeline for FDTD - pass device explicitly
-    renderContext = await setupFDTDRenderPipeline(fdtdSimulation, device);
+    renderContext = await setupFDTDRenderPipeline(fdtdSimulation, device, fdtdSim.getTextureSize());
 
     console.log('FDTD simulation ready. Starting loops...');
 
@@ -1161,7 +1165,7 @@ const startSimulationLoop = () => {
       if (fdtdSimulation) {
         // Inject oscillating source if mouse is down (matching reference behavior)
         if (mouseIsDown && mouseDownPosition) {
-          const gridSize = 512; // Match textureSize
+          const gridSize = fdtdSimulation.getTextureSize(); // Match simulation textureSize
           const brushHalfSize: [number, number] = [
             signalBrushSize / gridSize / 2,
             signalBrushSize / gridSize / 2
@@ -1202,7 +1206,7 @@ const injectOscillatingSource = (center: [number, number], halfSize: [number, nu
   device.queue.writeBuffer(paramsBuffer, 0, drawParams);
 
   const tempTexture = device.createTexture({
-    size: [512, 512],
+    size: [fdtdSimulation.getTextureSize(), fdtdSimulation.getTextureSize()],
     format: 'rgba32float',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
   });
@@ -1216,14 +1220,14 @@ const injectOscillatingSource = (center: [number, number], halfSize: [number, nu
     ],
   });
 
-  fdtdSimulation.runComputePass('drawSquare', bindGroup, Math.ceil(512 / 8), Math.ceil(512 / 8));
+  fdtdSimulation.runComputePass('drawSquare', bindGroup, Math.ceil(fdtdSimulation.getTextureSize() / 8), Math.ceil(fdtdSimulation.getTextureSize() / 8));
 
   // Copy result back
   const commandEncoder = device.createCommandEncoder();
   commandEncoder.copyTextureToTexture(
     { texture: tempTexture },
     { texture: fdtdSimulation.getTexture('sourceField')! },
-    [512, 512]
+    [fdtdSimulation.getTextureSize(), fdtdSimulation.getTextureSize()]
   );
   device.queue.submit([commandEncoder.finish()]);
 
