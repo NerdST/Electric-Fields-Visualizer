@@ -1,0 +1,7 @@
+build/
+*.o
+*.so
+*.a
+fdtd_server
+.vscode/
+.idea/
