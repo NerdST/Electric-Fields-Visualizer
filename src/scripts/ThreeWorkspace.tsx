@@ -58,9 +58,18 @@ let mouse = new THREE.Vector2();
 
 // Voltage point visualizations
 let voltagePointMeshes: Map<string, THREE.Mesh> = new Map();
+let voltagePointArrows: Map<string, THREE.Mesh[]> = new Map();
 const voltagePointGeometry = new THREE.SphereGeometry(0.15, 12, 12);
 const voltagePointMaterial = new THREE.MeshBasicMaterial({ 
   color: 0x00ff00, 
+  transparent: true, 
+  opacity: 0.8 
+});
+
+// Arrow geometry for voltage points (same size as field arrows)
+const voltageArrowGeometry = new THREE.ConeGeometry(0.05, 0.2, 8);
+const voltageArrowMaterial = new THREE.MeshBasicMaterial({ 
+  color: 0x4444ff, // Blue color
   transparent: true, 
   opacity: 0.8 
 });
@@ -117,6 +126,17 @@ const updateChargeMeshes = () => {
 const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
   const seen: Set<string> = new Set();
 
+  // Directions for the arrows (6 cardinal directions)
+  const directions = [
+    new THREE.Vector3(1, 0, 0),   // +x
+    new THREE.Vector3(-1, 0, 0), // -x
+    new THREE.Vector3(0, 1, 0),   // +y
+    new THREE.Vector3(0, -1, 0),  // -y
+    new THREE.Vector3(0, 0, 1),   // +z
+    new THREE.Vector3(0, 0, -1)  // -z
+  ];
+  const upVector = new THREE.Vector3(0, 1, 0);
+
   // Update existing and create missing
   for (const point of voltagePoints) {
     seen.add(point.id);
@@ -128,13 +148,56 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       voltagePointMeshes.set(point.id, mesh);
     }
     mesh.position.copy(point.position);
+
+    // Create or update arrows for this voltage point
+    let arrows = voltagePointArrows.get(point.id);
+    if (!arrows) {
+      arrows = [];
+      const sphereRadius = 0.15; // Radius of the voltage point sphere
+      const arrowLength = 0.2; // Length of the arrow
+      const offset = sphereRadius + arrowLength / 2; // Offset to start arrow from sphere surface
+      
+      for (let i = 0; i < directions.length; i++) {
+        const direction = directions[i];
+        const arrow = new THREE.Mesh(voltageArrowGeometry, voltageArrowMaterial);
+        const quaternion = new THREE.Quaternion().setFromUnitVectors(upVector, direction.clone().normalize());
+        arrow.setRotationFromQuaternion(quaternion);
+        // Position arrow so it extends outward from the sphere surface
+        arrow.position.copy(point.position).add(direction.clone().multiplyScalar(offset));
+        scene.add(arrow);
+        arrows.push(arrow);
+      }
+      voltagePointArrows.set(point.id, arrows);
+    } else {
+      // Update arrow positions
+      const sphereRadius = 0.15;
+      const arrowLength = 0.2;
+      const offset = sphereRadius + arrowLength / 2;
+      
+      for (let i = 0; i < arrows.length; i++) {
+        const arrow = arrows[i];
+        const direction = directions[i];
+        arrow.position.copy(point.position).add(direction.clone().multiplyScalar(offset));
+      }
+    }
   }
 
-  // Remove meshes that no longer have voltage points
+  // Remove meshes and arrows that no longer have voltage points
   for (const [id, mesh] of Array.from(voltagePointMeshes.entries())) {
     if (!seen.has(id)) {
       scene.remove(mesh);
       voltagePointMeshes.delete(id);
+      
+      // Remove arrows
+      const arrows = voltagePointArrows.get(id);
+      if (arrows) {
+        for (const arrow of arrows) {
+          scene.remove(arrow);
+          arrow.geometry.dispose();
+          (arrow.material as THREE.Material).dispose();
+        }
+        voltagePointArrows.delete(id);
+      }
     }
   }
 };
