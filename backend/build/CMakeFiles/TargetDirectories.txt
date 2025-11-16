@@ -1,0 +1,3 @@
+/mnt/shared/sangeeth/Documents/Personal_Projects/Fields_Visualizer/backend/build/CMakeFiles/fdtd_server.dir
+/mnt/shared/sangeeth/Documents/Personal_Projects/Fields_Visualizer/backend/build/CMakeFiles/edit_cache.dir
+/mnt/shared/sangeeth/Documents/Personal_Projects/Fields_Visualizer/backend/build/CMakeFiles/rebuild_cache.dir
