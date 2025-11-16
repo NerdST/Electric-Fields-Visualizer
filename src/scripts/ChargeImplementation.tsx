@@ -13,6 +13,7 @@ let renderBindGroupLayout: GPUBindGroupLayout;
 // Simulation state
 let simulationSpeed = 60; // Steps per second
 let simulationTimer: number | null = null;
+let simulationStepCount = 0; // Track total simulation steps
 // Store all static point charges as [x, y, charge] tuples
 const staticCharges: Array<[number, number, number]> = [];
 
@@ -65,6 +66,13 @@ const startSimulationLoop = () => {
         }
 
         fdtdSimulation.step();
+        simulationStepCount++;
+
+        // Update counter display
+        const counterElement = document.getElementById('step-counter');
+        if (counterElement) {
+          counterElement.textContent = `Step: ${simulationStepCount}`;
+        }
       }
     } catch (error) {
       console.error('Simulation step error:', error);
@@ -197,6 +205,15 @@ const ChargeCanvas = () => {
         top: '20px'
       }}>
         Click to add static point charges (charge = 1)
+      </div>
+      <div id="step-counter" style={{
+        color: '#666',
+        fontSize: '14px',
+        position: 'absolute',
+        top: '45px',
+        fontFamily: 'monospace'
+      }}>
+        Step: 0
       </div>
     </div>
   );
