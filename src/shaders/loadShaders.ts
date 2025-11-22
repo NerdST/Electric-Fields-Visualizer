@@ -6,6 +6,7 @@ import injectSourceShader from './compute/injectSource.wgsl?raw';
 import decaySourceShader from './compute/decaySource.wgsl?raw';
 import drawSquareShader from './compute/drawSquare.wgsl?raw';
 import drawEllipseShader from './compute/drawEllipse.wgsl?raw';
+import readFieldValueShader from './compute/readFieldValue.wgsl?raw';
 import fieldVertexShader from './render/fieldVertex.wgsl?raw';
 import fieldFragmentShader from './render/fieldFragment.wgsl?raw';
 
@@ -18,7 +19,8 @@ export function loadComputeShaders() {
     injectSource: injectSourceShader,
     decaySource: decaySourceShader,
     drawSquare: drawSquareShader,
-    drawEllipse: drawEllipseShader
+    drawEllipse: drawEllipseShader,
+    readFieldValue: readFieldValueShader
   };
 }
 

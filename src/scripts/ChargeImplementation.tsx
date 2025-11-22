@@ -11,7 +11,7 @@ let renderConfigBuffer: GPUBuffer;
 let renderBindGroupLayout: GPUBindGroupLayout;
 
 // Simulation state
-let simulationSpeed = 60; // Steps per second
+let simulationSpeed = 120; // Steps per second
 let simulationTimer: number | null = null;
 let simulationStepCount = 0; // Track total simulation steps
 // Store all static point charges as [x, y, charge] tuples
@@ -60,10 +60,8 @@ const startSimulationLoop = () => {
   const simStep = () => {
     try {
       if (fdtdSimulation) {
-        // Inject all static charges every step
-        for (const [x, y, charge] of staticCharges) {
-          injectStaticCharge([x, y], charge);
-        }
+        // Static charges are injected once when added, not every step
+        // This prevents infinite accumulation
 
         fdtdSimulation.step();
         simulationStepCount++;
@@ -86,13 +84,14 @@ const startSimulationLoop = () => {
 // Helper function to inject a static point charge into the source field
 const injectStaticCharge = (position: [number, number], charge: number) => {
   const gridSize = fdtdSimulation.getTextureSize();
-  const pixelRadius = 1.0 / gridSize; // Single pixel
+  const pixelRadius = 2.0 / gridSize; // 2 pixels for better visibility
 
+  // Inject charge once with proper magnitude
   const drawParams = new Float32Array([
     position[0], position[1], // position in [0,1] space
-    pixelRadius, pixelRadius, // radius (1 pixel)
-    0, 0, charge, 0, // z-component value (charge magnitude)
-    0, 0, 1, 1, // Replace mode: set to charge value (don't accumulate)
+    pixelRadius, pixelRadius, // radius
+    0, 0, charge * 10.0, 0, // z-component value (higher since injected once)
+    0, 0, 1, 1, // Replace mode: set value (don't accumulate)
   ]);
 
   const paramsBuffer = device.createBuffer({
@@ -148,8 +147,34 @@ const startRenderLoop = () => {
 };
 
 const ChargeCanvas = () => {
+  // Probe position in normalized [0, 1] space (matches texture coordinates)
+  const [probeX, setProbeX] = React.useState(0.5);
+  const [probeY, setProbeY] = React.useState(0.5);
+  const [fieldValue, setFieldValue] = React.useState<{ Ex: number, Ey: number, Ez: number, magnitude: number } | null>(null);
+
   React.useEffect(() => {
     initialize();
+
+    // Periodically read field value at probe position
+    const readProbeValue = async () => {
+      if (fdtdSimulation) {
+        try {
+          // Coordinates are already in [0,1] space - pass directly
+          const data = await fdtdSimulation.readFieldValueAt(probeX, probeY);
+          setFieldValue({
+            Ex: data[0],
+            Ey: data[1],
+            Ez: data[2],
+            magnitude: data[3]
+          });
+        } catch (error) {
+          console.error('Error reading field value:', error);
+        }
+      }
+    };
+
+    // Read probe value every 100ms
+    const probeTimer = setInterval(readProbeValue, 100);
 
     // Add mouse handler to place static point charges on click
     const handleMouseClick = (event: MouseEvent) => {
@@ -160,8 +185,9 @@ const ChargeCanvas = () => {
           const x = (event.clientX - rect.left) / rect.width; // [0, 1]
           const y = 1 - ((event.clientY - rect.top) / rect.height); // [0, 1] with y-flip
 
-          // Add a static point charge with charge = 1
-          staticCharges.push([x, y, 0.01]);
+          // Inject charge once immediately
+          injectStaticCharge([x, y], 1.0);
+          staticCharges.push([x, y, 1.0]);
           console.log(`Added static charge at (${x}, ${y}), total charges: ${staticCharges.length}`);
         }
       }
@@ -176,6 +202,7 @@ const ChargeCanvas = () => {
     }, 1000);
 
     return () => {
+      clearInterval(probeTimer);
       const canvas = document.getElementById('fdtd-canvas');
       if (canvas) {
         canvas.removeEventListener('click', handleMouseClick);
@@ -187,7 +214,28 @@ const ChargeCanvas = () => {
         fdtdSimulation.destroy();
       }
     };
-  }, []);
+  }, [probeX, probeY]);
+
+  // Test runner function
+  const runTests = async () => {
+    if (!fdtdSimulation || !device) {
+      console.error('Simulation not initialized');
+      return;
+    }
+
+    console.log('Starting FDTD accuracy tests...');
+    const { FDTDTests } = await import('../tests/FDTDTests');
+    const tester = new FDTDTests(device, fdtdSimulation);
+    await tester.runAllTests();
+  };
+
+  // Add center charge for testing
+  const addCenterCharge = () => {
+    staticCharges.length = 0; // Clear existing charges
+    injectStaticCharge([0.5, 0.5], 1.0); // Inject once immediately
+    staticCharges.push([0.5, 0.5, 1.0]);
+    console.log('Added test charge at center (0.5, 0.5)');
+  };
 
   return (
     <div style={{
@@ -204,7 +252,7 @@ const ChargeCanvas = () => {
         position: 'absolute',
         top: '20px'
       }}>
-        Click to add static point charges (charge = 1)
+        Click to add static point charges
       </div>
       <div id="step-counter" style={{
         color: '#666',
@@ -215,6 +263,117 @@ const ChargeCanvas = () => {
       }}>
         Step: 0
       </div>
+      <div style={{
+        position: 'absolute',
+        top: '70px',
+        left: '20px',
+        color: '#666',
+        fontSize: '12px',
+        fontFamily: 'monospace',
+        backgroundColor: 'rgba(255, 255, 255, 0.9)',
+        padding: '10px',
+        borderRadius: '5px',
+        border: '1px solid #ccc',
+        minWidth: '200px'
+      }}>
+        <div><strong>Probe Position (0 to 1):</strong></div>
+        <div style={{ marginTop: '5px' }}>
+          <label>X: </label>
+          <input
+            type="number"
+            value={probeX}
+            onChange={(e) => {
+              const val = parseFloat(e.target.value);
+              if (!isNaN(val)) setProbeX(Math.max(0, Math.min(1, val)));
+            }}
+            step="0.01"
+            min="0"
+            max="1"
+            style={{ width: '80px', marginLeft: '5px' }}
+          />
+        </div>
+        <div style={{ marginTop: '5px' }}>
+          <label>Y: </label>
+          <input
+            type="number"
+            value={probeY}
+            onChange={(e) => {
+              const val = parseFloat(e.target.value);
+              if (!isNaN(val)) setProbeY(Math.max(0, Math.min(1, val)));
+            }}
+            step="0.01"
+            min="0"
+            max="1"
+            style={{ width: '80px', marginLeft: '5px' }}
+          />
+        </div>
+        <div style={{ marginTop: '10px', fontSize: '10px', color: '#999' }}>
+          Texture coords: ({probeX.toFixed(3)}, {probeY.toFixed(3)})
+        </div>
+        <div style={{ marginTop: '8px' }}><strong>Electric Field:</strong></div>
+        {fieldValue ? (
+          <>
+            <div style={{ fontSize: '16px', fontWeight: 'bold', color: '#2196F3', marginTop: '4px' }}>
+              Ez: {fieldValue.Ez.toExponential(3)}
+            </div>
+            <div style={{ fontSize: '10px', color: '#999', marginTop: '8px' }}>
+              <div>Ex: {fieldValue.Ex.toExponential(3)} (≈0 for 2D)</div>
+              <div>Ey: {fieldValue.Ey.toExponential(3)} (≈0 for 2D)</div>
+            </div>
+          </>
+        ) : (
+          <div>Reading...</div>
+        )}
+        <div style={{ marginTop: '12px', borderTop: '1px solid #ddd', paddingTop: '10px' }}>
+          <button
+            onClick={addCenterCharge}
+            style={{
+              padding: '6px 12px',
+              marginRight: '5px',
+              cursor: 'pointer',
+              backgroundColor: '#4CAF50',
+              color: 'white',
+              border: 'none',
+              borderRadius: '3px',
+              fontSize: '11px'
+            }}
+          >
+            Add Center Charge
+          </button>
+          <button
+            onClick={runTests}
+            style={{
+              padding: '6px 12px',
+              cursor: 'pointer',
+              backgroundColor: '#2196F3',
+              color: 'white',
+              border: 'none',
+              borderRadius: '3px',
+              fontSize: '11px'
+            }}
+          >
+            Run Tests
+          </button>
+        </div>
+      </div>
+      {/* Probe position indicator overlay */}
+      <div
+        id="probe-indicator"
+        style={{
+          position: 'absolute',
+          left: `${probeX * 100}%`,
+          top: `${(1 - probeY) * 100}%`,
+          width: '12px',
+          height: '12px',
+          marginLeft: '-6px',
+          marginTop: '-6px',
+          borderRadius: '50%',
+          border: '2px solid #ff0000',
+          backgroundColor: 'rgba(255, 0, 0, 0.3)',
+          pointerEvents: 'none',
+          zIndex: 1000
+        }}
+      />
     </div>
   );
 };

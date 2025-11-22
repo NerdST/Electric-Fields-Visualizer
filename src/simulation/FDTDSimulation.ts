@@ -10,6 +10,8 @@ export class FDTDSimulation {
   private cellSize: number = 0.01;
   private time: number = 0;
   private alphaBetaDt: number = 0.001; // Track dt used for alpha-beta calculation
+  private readbackBuffer: GPUBuffer | null = null;
+  private stagingBuffer: GPUBuffer | null = null;
 
   constructor(device: GPUDevice, textureSize: number = 512) {
     this.device = device;
@@ -81,6 +83,25 @@ export class FDTDSimulation {
     // Initialize material properties (vacuum by default)
     this.initializeMaterialField();
     this.initializeAlphaBeta();
+
+    // Initialize readback buffers for CPU access
+    this.initializeReadbackBuffers();
+  }
+
+  private initializeReadbackBuffers() {
+    // Storage buffer for GPU to write field values
+    this.readbackBuffer = this.device.createBuffer({
+      size: 16, // 4 floats (Ex, Ey, Ez, magnitude)
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      label: 'readback_buffer'
+    });
+
+    // Staging buffer for CPU to read from
+    this.stagingBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      label: 'staging_buffer'
+    });
   }
 
   private initializeMaterialField() {
@@ -454,6 +475,64 @@ export class FDTDSimulation {
     return this.time;
   }
 
+  /**
+   * Read the electric field value at a specific point (x, y in normalized [0,1] coordinates)
+   * Returns a promise with [Ex, Ey, Ez, magnitude]
+   */
+  async readFieldValueAt(x: number, y: number): Promise<Float32Array> {
+    if (!this.readbackBuffer || !this.stagingBuffer) {
+      throw new Error('Readback buffers not initialized');
+    }
+
+    // Create parameters buffer with point coordinates
+    const paramsData = new Float32Array([x, y, this.textureSize, 0]);
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+
+    // Create bind group for readFieldValue shader
+    const pipeline = this.pipelines.get('readFieldValue');
+    if (!pipeline) {
+      throw new Error('readFieldValue pipeline not found');
+    }
+
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('electricField')!.createView() },
+        { binding: 1, resource: { buffer: this.readbackBuffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+      ],
+    });
+
+    // Run compute shader to read field value
+    const commandEncoder = this.device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
+    computePass.setPipeline(pipeline);
+    computePass.setBindGroup(0, bindGroup);
+    computePass.dispatchWorkgroups(1, 1, 1);
+    computePass.end();
+
+    // Copy from readback buffer to staging buffer
+    commandEncoder.copyBufferToBuffer(
+      this.readbackBuffer, 0,
+      this.stagingBuffer, 0,
+      16
+    );
+
+    this.device.queue.submit([commandEncoder.finish()]);
+    paramsBuffer.destroy();
+
+    // Map staging buffer and read data
+    await this.stagingBuffer.mapAsync(GPUMapMode.READ);
+    const data = new Float32Array(this.stagingBuffer.getMappedRange().slice(0));
+    this.stagingBuffer.unmap();
+
+    return data;
+  }
+
   // Add cleanup method
   destroy() {
     for (const texture of this.textures.values()) {
@@ -461,6 +540,12 @@ export class FDTDSimulation {
     }
     for (const buffer of this.buffers.values()) {
       buffer.destroy();
+    }
+    if (this.readbackBuffer) {
+      this.readbackBuffer.destroy();
+    }
+    if (this.stagingBuffer) {
+      this.stagingBuffer.destroy();
     }
   }
 }
