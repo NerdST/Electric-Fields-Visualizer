@@ -387,7 +387,9 @@ export class FDTDSimulation {
   }
 
   private decaySources() {
-    const decayParams = new Float32Array([this.dt, 0, 0, 0]);
+    // Pre-compute decay factor: exp(-ln(10) * dt) ≈ 0.1^dt
+    const decayFactor = Math.exp(-Math.LN10 * this.dt);
+    const decayParams = new Float32Array([decayFactor, 0, 0, 0]);
     const paramsBuffer = this.device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,

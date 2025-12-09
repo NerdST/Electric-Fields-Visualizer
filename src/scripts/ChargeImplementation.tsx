@@ -28,7 +28,7 @@ const initialize = async () => {
     console.log('WebGPU and FDTD initialized successfully');
 
     // Setup render pipeline for FDTD - pass device explicitly
-    const renderSetup = await setupFDTDRenderPipeline(fdtdSimulation, device, fdtdSim.getTextureSize());
+    const renderSetup = await setupFDTDRenderPipeline(device, fdtdSim.getTextureSize());
     renderContext = renderSetup.context;
     renderPipeline = renderSetup.renderPipeline;
     renderBindGroupLayout = renderSetup.renderBindGroupLayout;

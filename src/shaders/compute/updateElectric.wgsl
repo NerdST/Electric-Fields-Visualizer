@@ -11,37 +11,29 @@ struct FieldParams {
 
 @group(0) @binding(4) var outTex: texture_storage_2d<rgba32float, write>;
 
-@compute @workgroup_size(8, 8, 1)
+@compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dims = textureDimensions(outTex);
-  if (gid.x >= dims.x || gid.y >= dims.y) {
+  let coord = vec2<i32>(gid.xy);
+  
+  // Early exit
+  if (coord.x >= i32(dims.x) || coord.y >= i32(dims.y)) {
     return;
   }
 
-  let coord = vec2<i32>(gid.xy);
-
-  if (params.reflectiveBoundary == 0u) {
-    let b = vec2<i32>(2.0 * params.relativeCellSize * vec2<f32>(dims));
-    
-    let xAtMinBound = select(0, i32(params.relativeCellSize.x * f32(dims.x)), coord.x < b.x);
-    let xAtMaxBound = select(0, -i32(params.relativeCellSize.x * f32(dims.x)), coord.x + b.x >= i32(dims.x));
-    let yAtMinBound = select(0, i32(params.relativeCellSize.y * f32(dims.y)), coord.y < b.y);
-    let yAtMaxBound = select(0, -i32(params.relativeCellSize.y * f32(dims.y)), coord.y + b.y >= i32(dims.y));
-
-    if (xAtMinBound != 0 || xAtMaxBound != 0 || yAtMinBound != 0 || yAtMaxBound != 0) {
-      let boundaryCoord = coord + vec2<i32>(xAtMinBound + xAtMaxBound, yAtMinBound + yAtMaxBound);
-      let boundaryField = textureLoad(electricFieldTex, boundaryCoord, 0);
-      textureStore(outTex, coord, boundaryField);
-      return;
-    }
-  }
-
-  let alphaBeta = textureLoad(alphaBetaFieldTex, coord, 0).rg;
+  // Cache offset calculations
+  let offset_x = i32(params.relativeCellSize.x * f32(dims.x));
+  let offset_y = i32(params.relativeCellSize.y * f32(dims.y));
   
+  // Simple boundary: wrap or clamp
+  let coord_xn = vec2<i32>(coord.x - offset_x, coord.y);
+  let coord_yn = vec2<i32>(coord.x, coord.y - offset_y);
+  
+  let alphaBeta = textureLoad(alphaBetaFieldTex, coord, 0).rg;
   let el = textureLoad(electricFieldTex, coord, 0).rgb;
   let mag = textureLoad(magneticFieldTex, coord, 0).rgb;
-  let magXN = textureLoad(magneticFieldTex, coord - vec2<i32>(i32(params.relativeCellSize.x * f32(dims.x)), 0), 0).rgb;
-  let magYN = textureLoad(magneticFieldTex, coord - vec2<i32>(0, i32(params.relativeCellSize.y * f32(dims.y))), 0).rgb;
+  let magXN = textureLoad(magneticFieldTex, coord_xn, 0).rgb;
+  let magYN = textureLoad(magneticFieldTex, coord_yn, 0).rgb;
 
   let newEl = vec3<f32>(
     alphaBeta.x * el.x + alphaBeta.y * (mag.z - magYN.z),

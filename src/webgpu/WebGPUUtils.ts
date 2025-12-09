@@ -34,7 +34,7 @@ export const initializeWebGPUWithFDTD = async () => {
 };
 
 // Setup render pipeline for FDTD
-export const setupFDTDRenderPipeline = async (fdtdSim: FDTDSimulation, gpuDevice: GPUDevice, textureSize: number) => {
+export const setupFDTDRenderPipeline = async (gpuDevice: GPUDevice, textureSize: number) => {
   // Get or create the canvas element
   let canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement | null;
   if (!canvas) {

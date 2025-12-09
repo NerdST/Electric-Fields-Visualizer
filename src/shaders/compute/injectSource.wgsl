@@ -11,7 +11,7 @@ struct SourceParams {
 
 @group(0) @binding(3) var outTex: texture_storage_2d<rgba32float, write>;
 
-@compute @workgroup_size(8, 8, 1)
+@compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dims = textureDimensions(outTex);
   if (gid.x >= dims.x || gid.y >= dims.y) {
