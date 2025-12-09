@@ -11,7 +11,7 @@ let renderConfigBuffer: GPUBuffer;
 let renderBindGroupLayout: GPUBindGroupLayout;
 
 // Simulation state
-let simulationSpeed = 120; // Steps per second
+let simulationSpeed = 1024; // Steps per second
 let simulationTimer: number | null = null;
 let simulationStepCount = 0; // Track total simulation steps
 // Store all static point charges as [x, y, charge] tuples
@@ -152,29 +152,9 @@ const ChargeCanvas = () => {
   const [probeY, setProbeY] = React.useState(0.5);
   const [fieldValue, setFieldValue] = React.useState<{ Ex: number, Ey: number, Ez: number, magnitude: number } | null>(null);
 
+  // Initialize simulation once on mount
   React.useEffect(() => {
     initialize();
-
-    // Periodically read field value at probe position
-    const readProbeValue = async () => {
-      if (fdtdSimulation) {
-        try {
-          // Coordinates are already in [0,1] space - pass directly
-          const data = await fdtdSimulation.readFieldValueAt(probeX, probeY);
-          setFieldValue({
-            Ex: data[0],
-            Ey: data[1],
-            Ez: data[2],
-            magnitude: data[3]
-          });
-        } catch (error) {
-          console.error('Error reading field value:', error);
-        }
-      }
-    };
-
-    // Read probe value every 100ms
-    const probeTimer = setInterval(readProbeValue, 100);
 
     // Add mouse handler to place static point charges on click
     const handleMouseClick = (event: MouseEvent) => {
@@ -202,7 +182,6 @@ const ChargeCanvas = () => {
     }, 1000);
 
     return () => {
-      clearInterval(probeTimer);
       const canvas = document.getElementById('fdtd-canvas');
       if (canvas) {
         canvas.removeEventListener('click', handleMouseClick);
@@ -213,6 +192,33 @@ const ChargeCanvas = () => {
       if (fdtdSimulation) {
         fdtdSimulation.destroy();
       }
+    };
+  }, []);
+
+  // Separate effect for reading probe values when position changes
+  React.useEffect(() => {
+    const readProbeValue = async () => {
+      if (fdtdSimulation) {
+        try {
+          // Coordinates are already in [0,1] space - pass directly
+          const data = await fdtdSimulation.readFieldValueAt(probeX, probeY);
+          setFieldValue({
+            Ex: data[0],
+            Ey: data[1],
+            Ez: data[2],
+            magnitude: data[3]
+          });
+        } catch (error) {
+          console.error('Error reading field value:', error);
+        }
+      }
+    };
+
+    // Read probe value every 100ms
+    const probeTimer = setInterval(readProbeValue, 100);
+
+    return () => {
+      clearInterval(probeTimer);
     };
   }, [probeX, probeY]);
 

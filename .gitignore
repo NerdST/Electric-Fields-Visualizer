@@ -23,5 +23,8 @@ dist-ssr
 *.sln
 *.sw?
 backend/uWebSockets
+backend/uWebSockets/*
+
+/dist/
 
 commits.txt
