@@ -186,7 +186,7 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       arrows = [];
       for (let i = 0; i < arrowPositions.length; i++) {
         const arrow = new THREE.Mesh(voltageArrowGeometry, voltageArrowMaterial);
-        arrow.scale.set(1, 1, 1); // Initialize scale
+        arrow.scale.set(1, 1, 1); 
         scene.add(arrow);
         arrows.push(arrow);
       }
@@ -202,7 +202,6 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       const fieldResult = electricFieldAt(arrowPos, charges);
       const field = fieldResult.field;
       
-      // Calculate arrow length based on field magnitude (exactly like vector field)
       let arrowLength = field.length();
       
       if (field.length() < 1e-6) {
