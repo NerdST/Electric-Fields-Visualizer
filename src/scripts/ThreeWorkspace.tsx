@@ -270,16 +270,30 @@ const ThreeWorkspace: React.FC = () => {
   const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
   const [chargeStack, setChargeStack] = useState<string[]>([]);
   const [positionInputs, setPositionInputs] = useState({ x: '', y: '', z: '' });
+  const selectedChargeIdRef = useRef<string | null>(null);
+  const isEditingPositionRef = useRef(false);
   
   useEffect(() => {
-    if (selectedCharge) {
+    if (!isEditingPositionRef.current && selectedCharge && selectedCharge.id !== selectedChargeIdRef.current) {
+      selectedChargeIdRef.current = selectedCharge.id;
       setPositionInputs({
         x: selectedCharge.position.x.toString(),
         y: selectedCharge.position.y.toString(),
         z: selectedCharge.position.z.toString(),
       });
+    } else if (!selectedCharge) {
+      selectedChargeIdRef.current = null;
     }
-  }, [selectedCharge]);
+  }, [selectedCharge?.id]);
+  
+  useEffect(() => {
+    if (selectedCharge && !isEditingPositionRef.current) {
+      const currentCharge = chargesState.find(c => c.id === selectedCharge.id);
+      if (currentCharge && currentCharge.id === selectedChargeIdRef.current) {
+        setSelectedCharge(currentCharge);
+      }
+    }
+  }, [chargesState, selectedCharge?.id]);
 
   // Voltage measurement points (computed via electricFieldAt)
   const [voltagePoints, setVoltagePoints] = useState<VoltagePoint[]>([]);
@@ -736,6 +750,8 @@ const ThreeWorkspace: React.FC = () => {
               <input
                 type="text"
                 value={positionInputs.x}
+                onFocus={() => { isEditingPositionRef.current = true; }}
+                onBlur={() => { isEditingPositionRef.current = false; }}
                 onChange={(e) => {
                   const val = e.target.value;
                   if (val === '' || /^-?\d*\.?\d*$/.test(val)) {
@@ -765,6 +781,8 @@ const ThreeWorkspace: React.FC = () => {
               <input
                 type="text"
                 value={positionInputs.y}
+                onFocus={() => { isEditingPositionRef.current = true; }}
+                onBlur={() => { isEditingPositionRef.current = false; }}
                 onChange={(e) => {
                   const val = e.target.value;
                   if (val === '' || /^-?\d*\.?\d*$/.test(val)) {
@@ -794,6 +812,8 @@ const ThreeWorkspace: React.FC = () => {
               <input
                 type="text"
                 value={positionInputs.z}
+                onFocus={() => { isEditingPositionRef.current = true; }}
+                onBlur={() => { isEditingPositionRef.current = false; }}
                 onChange={(e) => {
                   const val = e.target.value;
                   if (val === '' || /^-?\d*\.?\d*$/.test(val)) {
