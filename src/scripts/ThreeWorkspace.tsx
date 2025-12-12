@@ -213,14 +213,12 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       const normalizedMagnitude = Math.min(arrowLength / maxFieldMagnitude, 1);
       arrowLength = Math.max(normalizedMagnitude * arrowScale, 0.1);
 
-      // Position arrow
       const direction = field.clone().normalize();
       const arrowStartPos = point.position.clone().add(
         direction.clone().multiplyScalar(sphereRadius + arrowOffset)
       );
       arrow.position.copy(arrowStartPos);
 
-      // Orient arrow in field direction
       const quaternion = new THREE.Quaternion().setFromUnitVectors(upVector, direction);
       arrow.setRotationFromQuaternion(quaternion);
       
