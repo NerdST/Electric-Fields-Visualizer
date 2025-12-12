@@ -14,6 +14,7 @@ export class FDTDSimulation {
   private stagingBuffer: GPUBuffer | null = null;
   private stagingBufferMapped: boolean = false; // Track if staging buffer is mapped
   private readbackInProgress: boolean = false; // Prevent concurrent readback calls
+  private readbackQueue: Array<{ x: number; y: number; resolve: (data: Float32Array) => void; reject: (err: any) => void }> = [];
 
   // Reusable resources to avoid allocation churn
   private tempTexture: GPUTexture | null = null;
@@ -494,93 +495,120 @@ export class FDTDSimulation {
    * Returns a promise with [Ex, Ey, Ez, magnitude]
    */
   async readFieldValueAt(x: number, y: number): Promise<Float32Array> {
-    // Serialize readback operations - only allow one at a time
+    // Return a promise that queues the readback
+    return new Promise<Float32Array>((resolve, reject) => {
+      this.readbackQueue.push({ x, y, resolve, reject });
+      this.processReadbackQueue();
+    });
+  }
+
+  private async processReadbackQueue() {
+    // If already processing, don't start another iteration
     if (this.readbackInProgress) {
-      return new Float32Array([0, 0, 0, 0]);
+      return;
     }
+
+    // If queue is empty, nothing to do
+    if (this.readbackQueue.length === 0) {
+      return;
+    }
+
     this.readbackInProgress = true;
 
     try {
-      if (!this.readbackBuffer || !this.stagingBuffer) {
-        throw new Error('Readback buffers not initialized');
-      }
+      // Process all queued items
+      while (this.readbackQueue.length > 0) {
+        const item = this.readbackQueue.shift()!;
 
-      // Ensure staging buffer is unmapped before use
-      if (this.stagingBufferMapped) {
         try {
-          this.stagingBuffer.unmap();
-          this.stagingBufferMapped = false;
-        } catch (e) {
-          // Ignore unmap errors
+          const result = await this.performReadback(item.x, item.y);
+          item.resolve(result);
+        } catch (error) {
+          item.reject(error);
         }
-      }
-
-      // Create parameters buffer with point coordinates
-      const paramsData = new Float32Array([x, y, this.textureSize, 0]);
-      const paramsBuffer = this.device.createBuffer({
-        size: 16,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
-      this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
-
-      // Create bind group for readFieldValue shader
-      const pipeline = this.pipelines.get('readFieldValue');
-      if (!pipeline) {
-        throw new Error('readFieldValue pipeline not found');
-      }
-
-      const bindGroup = this.device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: this.textures.get('electricField')!.createView() },
-          { binding: 1, resource: { buffer: this.readbackBuffer } },
-          { binding: 2, resource: { buffer: paramsBuffer } },
-        ],
-      });
-
-      // Run compute shader to read field value
-      const commandEncoder = this.device.createCommandEncoder();
-      const computePass = commandEncoder.beginComputePass();
-      computePass.setPipeline(pipeline);
-      computePass.setBindGroup(0, bindGroup);
-      computePass.dispatchWorkgroups(1, 1, 1);
-      computePass.end();
-
-      // Copy from readback buffer to staging buffer
-      commandEncoder.copyBufferToBuffer(
-        this.readbackBuffer, 0,
-        this.stagingBuffer, 0,
-        16
-      );
-
-      this.device.queue.submit([commandEncoder.finish()]);
-
-      // Wait for GPU to finish the submitted work before mapping or destroying resources
-      await this.device.queue.onSubmittedWorkDone();
-
-      // Now safe to destroy the params buffer
-      paramsBuffer.destroy();
-
-      // Map staging buffer and read data - with proper error handling
-      try {
-        await this.stagingBuffer.mapAsync(GPUMapMode.READ);
-        this.stagingBufferMapped = true;
-
-        const mappedData = this.stagingBuffer.getMappedRange();
-        const data = new Float32Array(4);
-        data.set(new Float32Array(mappedData));
-
-        this.stagingBuffer.unmap();
-        this.stagingBufferMapped = false;
-
-        return data;
-      } catch (error) {
-        console.error('Failed to map staging buffer:', error);
-        // Return zero field if readback fails
-        return new Float32Array([0, 0, 0, 0]);
       }
     } finally {
       this.readbackInProgress = false;
+    }
+  }
+
+  private async performReadback(x: number, y: number): Promise<Float32Array> {
+    if (!this.readbackBuffer || !this.stagingBuffer) {
+      throw new Error('Readback buffers not initialized');
+    }
+
+    // Ensure staging buffer is unmapped before use
+    if (this.stagingBufferMapped) {
+      try {
+        this.stagingBuffer.unmap();
+        this.stagingBufferMapped = false;
+      } catch (e) {
+        // Ignore unmap errors
+      }
+    }
+
+    // Create parameters buffer with point coordinates
+    const paramsData = new Float32Array([x, y, this.textureSize, 0]);
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+
+    // Create bind group for readFieldValue shader
+    const pipeline = this.pipelines.get('readFieldValue');
+    if (!pipeline) {
+      throw new Error('readFieldValue pipeline not found');
+    }
+
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('electricField')!.createView() },
+        { binding: 1, resource: { buffer: this.readbackBuffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+      ],
+    });
+
+    // Run compute shader to read field value
+    const commandEncoder = this.device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
+    computePass.setPipeline(pipeline);
+    computePass.setBindGroup(0, bindGroup);
+    computePass.dispatchWorkgroups(1, 1, 1);
+    computePass.end();
+
+    // Copy from readback buffer to staging buffer
+    commandEncoder.copyBufferToBuffer(
+      this.readbackBuffer, 0,
+      this.stagingBuffer, 0,
+      16
+    );
+
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Wait for GPU to finish the submitted work before mapping or destroying resources
+    await this.device.queue.onSubmittedWorkDone();
+
+    // Now safe to destroy the params buffer
+    paramsBuffer.destroy();
+
+    // Map staging buffer and read data - with proper error handling
+    try {
+      await this.stagingBuffer.mapAsync(GPUMapMode.READ);
+      this.stagingBufferMapped = true;
+
+      const mappedData = this.stagingBuffer.getMappedRange();
+      const data = new Float32Array(4);
+      data.set(new Float32Array(mappedData));
+
+      this.stagingBuffer.unmap();
+      this.stagingBufferMapped = false;
+
+      return data;
+    } catch (error) {
+      console.error('Failed to map staging buffer:', error);
+      throw error;
     }
   }
 
