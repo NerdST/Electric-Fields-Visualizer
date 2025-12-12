@@ -120,7 +120,11 @@ export class VectorFieldRenderer {
 
   public updateCharges(charges: Charge[]) {
     this.charges = charges;
+    const wasVisible = this.arrowMesh ? this.arrowMesh.visible : true;
     this.updateVectorField();
+    if (this.arrowMesh) {
+      this.arrowMesh.visible = wasVisible;
+    }
   }
 
   public updateConfig(config: Partial<VectorFieldConfig>) {

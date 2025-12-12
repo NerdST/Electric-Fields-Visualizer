@@ -318,10 +318,13 @@ const ThreeWorkspace: React.FC = () => {
       vfUpdateScheduled.current = true;
       requestAnimationFrame(() => {
         vfUpdateScheduled.current = false;
-        vectorFieldRenderer.updateCharges(nextCharges);
+        if (vectorFieldRenderer && showVectorField) {
+          vectorFieldRenderer.updateCharges(nextCharges);
+          vectorFieldRenderer.setVisible(true);
+        }
       });
     },
-    [vectorFieldRenderer],
+    [vectorFieldRenderer, showVectorField],
   );
 
   // Charge management
