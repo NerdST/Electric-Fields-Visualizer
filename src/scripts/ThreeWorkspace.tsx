@@ -122,17 +122,16 @@ const updateChargeMeshes = () => {
 // Function to update voltage point meshes
 const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
   const seen: Set<string> = new Set();
-
-  // Directions for the arrows (6 cardinal directions)
-  const directions = [
-    new THREE.Vector3(1, 0, 0), // +x
-    new THREE.Vector3(-1, 0, 0), // -x
-    new THREE.Vector3(0, 1, 0), // +y
-    new THREE.Vector3(0, -1, 0), // -y
-    new THREE.Vector3(0, 0, 1), // +z
-    new THREE.Vector3(0, 0, -1), // -z
-  ];
   const upVector = new THREE.Vector3(0, 1, 0);
+  const sphereRadius = 0.15;
+  const arrowOffset = sphereRadius + 0.1; // Distance from orb surface
+  const arrowScale = 0.3; // Base arrow length
+  const maxFieldMagnitude = 1e4;
+
+  // Generate points around each voltage orb in a small grid
+  const gridSize = 3; // 3x3x3 grid around each orb
+  const gridStep = 0.4; // Distance between grid points
+  const gridOffset = -(gridSize - 1) * gridStep / 2;
 
   // Update existing and create missing
   for (const point of voltagePoints) {
@@ -148,39 +147,85 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
 
     // Create or update arrows for this voltage point
     let arrows = voltagePointArrows.get(point.id);
+    
+    // Calculate positions for arrows around the orb
+    const arrowPositions: THREE.Vector3[] = [];
+    for (let x = 0; x < gridSize; x++) {
+      for (let y = 0; y < gridSize; y++) {
+        for (let z = 0; z < gridSize; z++) {
+          // Skip the center position (where the orb is)
+          if (x === 1 && y === 1 && z === 1) continue;
+          
+          const offset = new THREE.Vector3(
+            gridOffset + x * gridStep,
+            gridOffset + y * gridStep,
+            gridOffset + z * gridStep
+          );
+          const arrowPos = point.position.clone().add(offset);
+          
+          // Only add arrows that are at a reasonable distance from the orb
+          const distance = offset.length();
+          if (distance > sphereRadius && distance < sphereRadius + 0.6) {
+            arrowPositions.push(arrowPos);
+          }
+        }
+      }
+    }
+
+    // Remove old arrows if count changed
+    if (arrows && arrows.length !== arrowPositions.length) {
+      for (const arrow of arrows) {
+        scene.remove(arrow);
+        arrow.geometry.dispose();
+        (arrow.material as THREE.Material).dispose();
+      }
+      arrows = undefined;
+      voltagePointArrows.delete(point.id);
+    }
+
     if (!arrows) {
       arrows = [];
-      const sphereRadius = 0.15;
-      const arrowLength = 0.2;
-      const offset = sphereRadius + arrowLength / 2;
-
-      for (let i = 0; i < directions.length; i++) {
-        const direction = directions[i];
+      for (let i = 0; i < arrowPositions.length; i++) {
         const arrow = new THREE.Mesh(voltageArrowGeometry, voltageArrowMaterial);
-        const quaternion = new THREE.Quaternion().setFromUnitVectors(
-          upVector,
-          direction.clone().normalize(),
-        );
-        arrow.setRotationFromQuaternion(quaternion);
-        arrow.position
-          .copy(point.position)
-          .add(direction.clone().multiplyScalar(offset));
         scene.add(arrow);
         arrows.push(arrow);
       }
       voltagePointArrows.set(point.id, arrows);
-    } else {
-      const sphereRadius = 0.15;
-      const arrowLength = 0.2;
-      const offset = sphereRadius + arrowLength / 2;
+    }
 
-      for (let i = 0; i < arrows.length; i++) {
-        const arrow = arrows[i];
-        const direction = directions[i];
-        arrow.position
-          .copy(point.position)
-          .add(direction.clone().multiplyScalar(offset));
+    // Update arrow positions and orientations based on electric field
+    for (let i = 0; i < arrowPositions.length && i < arrows.length; i++) {
+      const arrow = arrows[i];
+      const arrowPos = arrowPositions[i];
+      
+      // Calculate electric field at this position
+      const fieldResult = electricFieldAt(arrowPos, charges);
+      const field = fieldResult.field;
+      
+      if (field.length() < 1e-6) {
+        // Hide arrow if field is too small
+        arrow.scale.set(0, 0, 0);
+        continue;
       }
+
+      // Calculate arrow length based on field magnitude
+      let arrowLength = field.length();
+      const normalizedMagnitude = Math.min(arrowLength / maxFieldMagnitude, 1);
+      arrowLength = Math.max(normalizedMagnitude * arrowScale, 0.1);
+
+      // Position arrow
+      const direction = field.clone().normalize();
+      const arrowStartPos = point.position.clone().add(
+        direction.clone().multiplyScalar(sphereRadius + arrowOffset)
+      );
+      arrow.position.copy(arrowStartPos);
+
+      // Orient arrow in field direction
+      const quaternion = new THREE.Quaternion().setFromUnitVectors(upVector, direction);
+      arrow.setRotationFromQuaternion(quaternion);
+      
+      // Scale arrow (length along Y axis)
+      arrow.scale.set(1, arrowLength, 1);
     }
   }
 
