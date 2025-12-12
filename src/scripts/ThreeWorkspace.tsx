@@ -82,8 +82,8 @@ const updateChargeMeshes = () => {
       charge.magnitude > 0 ? positiveChargeMaterial : negativeChargeMaterial;
     if (!mesh) {
       mesh = new THREE.Mesh(chargeGeometry, desiredMaterial);
-      mesh.userData = { chargeId: charge.id };
-      scene.add(mesh);
+  mesh.userData = { chargeId: charge.id };
+  scene.add(mesh);
       chargeMeshes.set(charge.id, mesh);
     } else {
       const isPositive = mesh.material === positiveChargeMaterial;
@@ -124,7 +124,7 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
   const seen: Set<string> = new Set();
   const upVector = new THREE.Vector3(0, 1, 0);
   const sphereRadius = 0.15;
-  const arrowScale = 0.3; // Base arrow length
+  const arrowScale = 2.0; 
   const maxFieldMagnitude = 1e4;
 
   // Generate points around each voltage orb in a small grid
@@ -186,6 +186,7 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       arrows = [];
       for (let i = 0; i < arrowPositions.length; i++) {
         const arrow = new THREE.Mesh(voltageArrowGeometry, voltageArrowMaterial);
+        arrow.scale.set(1, 1, 1); // Initialize scale
         scene.add(arrow);
         arrows.push(arrow);
       }
@@ -201,26 +202,27 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       const fieldResult = electricFieldAt(arrowPos, charges);
       const field = fieldResult.field;
       
+      // Calculate arrow length based on field magnitude (exactly like vector field)
+      let arrowLength = field.length();
+      
       if (field.length() < 1e-6) {
         // Hide arrow if field is too small
         arrow.scale.set(0, 0, 0);
         continue;
       }
 
-      // Calculate arrow length based on field magnitude
-      let arrowLength = field.length();
       const normalizedMagnitude = Math.min(arrowLength / maxFieldMagnitude, 1);
       arrowLength = Math.max(normalizedMagnitude * arrowScale, 0.1);
 
-      // Position arrow at the grid position (around the orb)
+      // Position arrow at the grid position (same as vector field)
       arrow.position.copy(arrowPos);
-
+      
       // Orient arrow in field direction
       const direction = field.clone().normalize();
       const quaternion = new THREE.Quaternion().setFromUnitVectors(upVector, direction);
       arrow.setRotationFromQuaternion(quaternion);
       
-      // Scale arrow (length along Y axis)
+      // Scale arrow (length along Y axis) - exactly like vector field
       arrow.scale.set(1, arrowLength, 1);
     }
   }
@@ -467,10 +469,10 @@ const ThreeWorkspace: React.FC = () => {
     controls.enableDamping = true;
 
     if (!vectorFieldInitialized.current) {
-      const vectorFieldConfig = createDefaultVectorFieldConfig();
-      const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
-      vfRenderer.updateCharges(charges);
-      setVectorFieldRenderer(vfRenderer);
+    const vectorFieldConfig = createDefaultVectorFieldConfig();
+    const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
+    vfRenderer.updateCharges(charges);
+    setVectorFieldRenderer(vfRenderer);
       vectorFieldInitialized.current = true;
     }
 
@@ -547,18 +549,18 @@ const ThreeWorkspace: React.FC = () => {
         ref={containerRef}
         style={{ width: '100%', height: '100%', background: '#282c34' }}
       />
-
+      
       {/* Control panel - top left */}
       <div
         style={{
-          position: 'absolute',
-          top: '10px',
-          left: '10px',
+        position: 'absolute',
+        top: '10px',
+        left: '10px',
           background: 'rgba(0, 0, 0, 0.8)',
-          color: 'white',
+        color: 'white',
           padding: '15px',
           borderRadius: '8px',
-          fontFamily: 'monospace',
+        fontFamily: 'monospace',
           fontSize: '12px',
           minWidth: '260px',
         }}
@@ -646,11 +648,11 @@ const ThreeWorkspace: React.FC = () => {
         </div>
 
         <div style={{ marginBottom: '10px' }}>
-          <button
-            onClick={toggleVectorField}
-            style={{
+        <button 
+          onClick={toggleVectorField}
+          style={{
               padding: '8px 12px',
-              background: showVectorField ? '#4CAF50' : '#f44336',
+            background: showVectorField ? '#4CAF50' : '#f44336',
               color: 'white',
               border: 'none',
               borderRadius: '4px',
