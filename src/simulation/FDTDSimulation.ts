@@ -15,6 +15,11 @@ export class FDTDSimulation {
   private stagingBufferMapped: boolean = false; // Track if staging buffer is mapped
   private readbackInProgress: boolean = false; // Prevent concurrent readback calls
 
+  // Reusable resources to avoid allocation churn
+  private tempTexture: GPUTexture | null = null;
+  private injectParamsBuffer: GPUBuffer | null = null;
+  private decayParamsBuffer: GPUBuffer | null = null;
+
   constructor(device: GPUDevice, textureSize: number = 512) {
     this.device = device;
     this.textureSize = textureSize;
@@ -88,6 +93,32 @@ export class FDTDSimulation {
 
     // Initialize readback buffers for CPU access
     this.initializeReadbackBuffers();
+
+    // Initialize reusable temp resources
+    this.initializeReusableResources();
+  }
+
+  private initializeReusableResources() {
+    // Create persistent temp texture for compute passes
+    this.tempTexture = this.device.createTexture({
+      size: [this.textureSize, this.textureSize],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+      label: 'temp_compute_texture'
+    });
+
+    // Create persistent parameter buffers
+    this.injectParamsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'inject_params_buffer'
+    });
+
+    this.decayParamsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'decay_params_buffer'
+    });
   }
 
   private initializeReadbackBuffers() {
@@ -241,8 +272,10 @@ export class FDTDSimulation {
     // Inject sources into electric field
     this.injectSources();
 
-    // Decay sources
-    this.decaySources();
+    // Decay sources - DISABLED for static charge simulations
+    // For electrostatic fields, charge density should remain constant
+    // Only enable for dynamic/oscillating sources (antennas, etc.)
+    // this.decaySources();
 
     // Update electric field
     this.updateElectricField();
@@ -356,26 +389,15 @@ export class FDTDSimulation {
     this.swapSourceBuffers();
 
     const sourceParams = new Float32Array([this.dt, 0, 0, 0]);
-    const paramsBuffer = this.device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(paramsBuffer, 0, sourceParams);
-
-    // Create temporary texture for output
-    const tempTexture = this.device.createTexture({
-      size: [this.textureSize, this.textureSize],
-      format: 'rgba16float',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
-    });
+    this.device.queue.writeBuffer(this.injectParamsBuffer!, 0, sourceParams);
 
     const bindGroup = this.device.createBindGroup({
       layout: this.pipelines.get('injectSource')!.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: this.textures.get('sourceFieldNext')!.createView() }, // Previous source field
         { binding: 1, resource: this.textures.get('electricFieldNext')!.createView() }, // Previous electric field
-        { binding: 2, resource: { buffer: paramsBuffer } },
-        { binding: 3, resource: tempTexture.createView() },
+        { binding: 2, resource: { buffer: this.injectParamsBuffer! } },
+        { binding: 3, resource: this.tempTexture!.createView() },
       ],
     });
 
@@ -383,35 +405,23 @@ export class FDTDSimulation {
       Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
 
     // Copy result back to current electric field
-    this.copyTexture(tempTexture, this.textures.get('electricField')!);
-    tempTexture.destroy();
-    paramsBuffer.destroy();
+    this.copyTexture(this.tempTexture!, this.textures.get('electricField')!);
   }
 
+  /* DISABLED: Source decay not needed for static electrostatic fields
   private decaySources() {
     // Pre-compute decay factor: exp(-ln(1000) * dt) ≈ 0.001^dt (very fast decay to prevent unbounded growth)
     // With dt=0.001: decay ≈ 0.9931 per step, so after 1000 steps source field is ~0.37% of original
     const decayFactor = Math.exp(-Math.LN10 * 3.0 * this.dt);
     const decayParams = new Float32Array([decayFactor, 0, 0, 0]);
-    const paramsBuffer = this.device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(paramsBuffer, 0, decayParams);
-
-    // Create temporary texture for decay operation
-    const tempTexture = this.device.createTexture({
-      size: [this.textureSize, this.textureSize],
-      format: 'rgba16float',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
-    });
+    this.device.queue.writeBuffer(this.decayParamsBuffer!, 0, decayParams);
 
     const bindGroup = this.device.createBindGroup({
       layout: this.pipelines.get('decaySource')!.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: this.textures.get('sourceFieldNext')!.createView() }, // Previous source field
-        { binding: 1, resource: { buffer: paramsBuffer } },
-        { binding: 2, resource: tempTexture.createView() },
+        { binding: 1, resource: { buffer: this.decayParamsBuffer! } },
+        { binding: 2, resource: this.tempTexture!.createView() },
       ],
     });
 
@@ -419,10 +429,9 @@ export class FDTDSimulation {
       Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
 
     // Copy result back to current source field
-    this.copyTexture(tempTexture, this.textures.get('sourceField')!);
-    tempTexture.destroy();
-    paramsBuffer.destroy();
+    this.copyTexture(this.tempTexture!, this.textures.get('sourceField')!);
   }
+  */
 
   private swapSourceBuffers() {
     // Swap source field buffers
@@ -545,10 +554,12 @@ export class FDTDSimulation {
       );
 
       this.device.queue.submit([commandEncoder.finish()]);
-      paramsBuffer.destroy();
 
-      // Wait for GPU to finish the submitted work before mapping
+      // Wait for GPU to finish the submitted work before mapping or destroying resources
       await this.device.queue.onSubmittedWorkDone();
+
+      // Now safe to destroy the params buffer
+      paramsBuffer.destroy();
 
       // Map staging buffer and read data - with proper error handling
       try {
@@ -595,6 +606,15 @@ export class FDTDSimulation {
     }
     if (this.stagingBuffer) {
       this.stagingBuffer.destroy();
+    }
+    if (this.tempTexture) {
+      this.tempTexture.destroy();
+    }
+    if (this.injectParamsBuffer) {
+      this.injectParamsBuffer.destroy();
+    }
+    if (this.decayParamsBuffer) {
+      this.decayParamsBuffer.destroy();
     }
   }
 }

@@ -81,6 +81,21 @@ const startSimulationLoop = () => {
   simulationTimer = window.setInterval(simStep, 1000 / simulationSpeed);
 };
 
+const pauseSimulationLoop = () => {
+  if (simulationTimer) {
+    clearInterval(simulationTimer);
+    simulationTimer = null;
+    console.log('Simulation paused');
+  }
+};
+
+const resumeSimulationLoop = () => {
+  if (!simulationTimer) {
+    startSimulationLoop();
+    console.log('Simulation resumed');
+  }
+};
+
 // Helper function to inject a static point charge into the source field
 const injectStaticCharge = async (position: [number, number], charge: number) => {
   const gridSize = fdtdSimulation.getTextureSize();
@@ -240,9 +255,22 @@ const ChargeCanvas = () => {
     }
 
     console.log('Starting FDTD accuracy tests...');
-    const { FDTDTests } = await import('../tests/FDTDTests');
-    const tester = new FDTDTests(device, fdtdSimulation);
-    await tester.runAllTests();
+    console.log('Pausing simulation to avoid race conditions...');
+
+    // Pause simulation during tests to avoid concurrent texture access
+    pauseSimulationLoop();
+
+    // Wait a moment for any pending GPU work to complete
+    await device.queue.onSubmittedWorkDone();
+
+    try {
+      const { FDTDTests } = await import('../tests/FDTDTests');
+      const tester = new FDTDTests(device, fdtdSimulation);
+      await tester.runAllTests();
+    } finally {
+      console.log('Tests complete, resuming simulation...');
+      resumeSimulationLoop();
+    }
   };
 
   // Add center charge for testing
@@ -270,14 +298,37 @@ const ChargeCanvas = () => {
       }}>
         Click to add static point charges
       </div>
-      <div id="step-counter" style={{
-        color: '#666',
-        fontSize: '14px',
+      <div style={{
         position: 'absolute',
-        top: '45px',
-        fontFamily: 'monospace'
+        top: '20px',
+        left: '20px',
+        display: 'flex',
+        gap: '15px',
+        alignItems: 'center'
       }}>
-        Step: 0
+        <div id="step-counter" style={{
+          color: '#2196F3',
+          fontSize: '16px',
+          fontWeight: 'bold',
+          fontFamily: 'monospace',
+          backgroundColor: 'rgba(33, 150, 243, 0.1)',
+          padding: '8px 12px',
+          borderRadius: '4px',
+          border: '1px solid #2196F3'
+        }}>
+          🔄 Step: 0
+        </div>
+        {/* <div style={{
+          fontSize: '11px',
+          color: '#666',
+          fontFamily: 'monospace',
+          padding: '4px 8px',
+          backgroundColor: 'rgba(0, 200, 83, 0.1)',
+          borderRadius: '3px',
+          border: '1px solid #00C853'
+        }}>
+          ♾️ Infinite Ping-Pong Buffers
+        </div> */}
       </div>
       <div style={{
         position: 'absolute',

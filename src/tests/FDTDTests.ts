@@ -147,8 +147,12 @@ export class FDTDTests {
         points.map(p => this.simulation.readFieldValueAt(p.x, p.y))
       );
 
-      const magnitudes = fields.map(f => Math.abs(f[2]));
+      // Use magnitude (index 3) instead of just Ez component
+      const magnitudes = fields.map(f => f[3]);
       const avgMagnitude = magnitudes.reduce((a, b) => a + b, 0) / magnitudes.length;
+
+      console.log('Radial symmetry test - magnitudes:', magnitudes, 'average:', avgMagnitude);
+      console.log('Raw field data:', fields);
 
       // Check if all magnitudes are within tolerance of average
       const tolerance = 0.4; // 40% tolerance - grid discretization causes asymmetry

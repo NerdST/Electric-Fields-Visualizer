@@ -8,18 +8,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   // Read parameters
   let x = params.x;
   let y = params.y;
-  let texSize = u32(params.z);
+  let texSize = i32(params.z);
   
   // Convert normalized coordinates [0,1] to pixel coordinates
-  let pixelX = u32(x * f32(texSize));
-  let pixelY = u32(y * f32(texSize));
+  let pixelX = i32(x * f32(texSize));
+  let pixelY = i32(y * f32(texSize));
   
   // Clamp to texture bounds
-  let clampedX = clamp(pixelX, 0u, texSize - 1u);
-  let clampedY = clamp(pixelY, 0u, texSize - 1u);
+  let clampedX = clamp(pixelX, 0, texSize - 1);
+  let clampedY = clamp(pixelY, 0, texSize - 1);
   
   // Read the electric field value at this point
-  let fieldValue = textureLoad(electricFieldTexture, vec2<u32>(clampedX, clampedY), 0);
+  let fieldValue = textureLoad(electricFieldTexture, vec2<i32>(clampedX, clampedY), 0);
   
   // Store in output buffer (x, y, z components of E field + magnitude)
   outputBuffer[0] = fieldValue.x;
