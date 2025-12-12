@@ -120,10 +120,18 @@ export class VectorFieldRenderer {
 
   public updateCharges(charges: Charge[]) {
     this.charges = charges;
-    const wasVisible = this.arrowMesh ? this.arrowMesh.visible : true;
+    if (!this.arrowMesh) return;
+    
+    const wasVisible = this.arrowMesh.visible;
+    const wasInScene = this.scene.children.includes(this.arrowMesh);
+    
     this.updateVectorField();
+    
     if (this.arrowMesh) {
       this.arrowMesh.visible = wasVisible;
+      if (!wasInScene && wasVisible) {
+        this.scene.add(this.arrowMesh);
+      }
     }
   }
 

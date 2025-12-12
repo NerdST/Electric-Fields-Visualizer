@@ -318,9 +318,12 @@ const ThreeWorkspace: React.FC = () => {
       vfUpdateScheduled.current = true;
       requestAnimationFrame(() => {
         vfUpdateScheduled.current = false;
-        if (vectorFieldRenderer && showVectorField) {
+        if (vectorFieldRenderer) {
+          const shouldBeVisible = showVectorField;
           vectorFieldRenderer.updateCharges(nextCharges);
-          vectorFieldRenderer.setVisible(true);
+          if (shouldBeVisible) {
+            vectorFieldRenderer.setVisible(true);
+          }
         }
       });
     },
@@ -413,9 +416,11 @@ const ThreeWorkspace: React.FC = () => {
       charges = newCharges;
       setChargesState(newCharges);
       updateChargeMeshes();
-      scheduleVectorFieldUpdate(newCharges);
+      if (vectorFieldRenderer && showVectorField) {
+        scheduleVectorFieldUpdate(newCharges);
+      }
     },
-    [chargesState, scheduleVectorFieldUpdate],
+    [chargesState, scheduleVectorFieldUpdate, vectorFieldRenderer, showVectorField],
   );
 
   // Voltage point management (points store physically computed potentials)
