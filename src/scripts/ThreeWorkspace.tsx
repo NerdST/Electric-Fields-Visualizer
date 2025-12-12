@@ -124,7 +124,6 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
   const seen: Set<string> = new Set();
   const upVector = new THREE.Vector3(0, 1, 0);
   const sphereRadius = 0.15;
-  const arrowOffset = sphereRadius + 0.1; // Distance from orb surface
   const arrowScale = 0.3; // Base arrow length
   const maxFieldMagnitude = 1e4;
 
@@ -213,12 +212,11 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       const normalizedMagnitude = Math.min(arrowLength / maxFieldMagnitude, 1);
       arrowLength = Math.max(normalizedMagnitude * arrowScale, 0.1);
 
-      const direction = field.clone().normalize();
-      const arrowStartPos = point.position.clone().add(
-        direction.clone().multiplyScalar(sphereRadius + arrowOffset)
-      );
-      arrow.position.copy(arrowStartPos);
+      // Position arrow at the grid position (around the orb)
+      arrow.position.copy(arrowPos);
 
+      // Orient arrow in field direction
+      const direction = field.clone().normalize();
       const quaternion = new THREE.Quaternion().setFromUnitVectors(upVector, direction);
       arrow.setRotationFromQuaternion(quaternion);
       
