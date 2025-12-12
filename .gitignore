@@ -28,3 +28,4 @@ backend/uWebSockets/*
 /dist/
 
 commits.txt
+WEBGL_WEBGPU_COMPARISON.md

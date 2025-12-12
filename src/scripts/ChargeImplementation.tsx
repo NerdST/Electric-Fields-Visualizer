@@ -82,7 +82,7 @@ const startSimulationLoop = () => {
 };
 
 // Helper function to inject a static point charge into the source field
-const injectStaticCharge = (position: [number, number], charge: number) => {
+const injectStaticCharge = async (position: [number, number], charge: number) => {
   const gridSize = fdtdSimulation.getTextureSize();
   const pixelRadius = 2.0 / gridSize; // 2 pixels for better visibility
 
@@ -102,7 +102,7 @@ const injectStaticCharge = (position: [number, number], charge: number) => {
 
   const tempTexture = device.createTexture({
     size: [gridSize, gridSize],
-    format: 'rgba32float',
+    format: 'rgba16float',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
   });
 
@@ -117,14 +117,24 @@ const injectStaticCharge = (position: [number, number], charge: number) => {
 
   fdtdSimulation.runComputePass('drawEllipse', bindGroup, Math.ceil(gridSize / 8), Math.ceil(gridSize / 8));
 
-  // Copy result back
+  // Copy result back into both current and next source textures (double buffer)
   const commandEncoder = device.createCommandEncoder();
   commandEncoder.copyTextureToTexture(
     { texture: tempTexture },
     { texture: fdtdSimulation.getTexture('sourceField')! },
     [gridSize, gridSize]
   );
+  const nextSourceTex = fdtdSimulation.getTexture('sourceFieldNext');
+  if (nextSourceTex) {
+    commandEncoder.copyTextureToTexture(
+      { texture: tempTexture },
+      { texture: nextSourceTex },
+      [gridSize, gridSize]
+    );
+  }
   device.queue.submit([commandEncoder.finish()]);
+  // Ensure GPU has finished before cleaning up
+  await device.queue.onSubmittedWorkDone();
 
   tempTexture.destroy();
   paramsBuffer.destroy();

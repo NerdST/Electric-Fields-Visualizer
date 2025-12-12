@@ -9,7 +9,7 @@ struct FieldParams {
 };
 @group(0) @binding(3) var<uniform> params: FieldParams;
 
-@group(0) @binding(4) var outTex: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(4) var outTex: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -41,5 +41,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     alphaBeta.x * mag.z - alphaBeta.y * ((elXP.y - el.y) - (elYP.x - el.x))
   );
 
-  textureStore(outTex, coord, vec4<f32>(newMag, 0.0));
+  // Prevent numerical overflow/underflow - clamp to reasonable physical bounds
+  // Most EM fields don't exceed ±1e6 A/m in practical simulations
+  let maxField = 1e6;
+  let clampedMag = clamp(newMag, vec3<f32>(-maxField), vec3<f32>(maxField));
+
+  textureStore(outTex, coord, vec4<f32>(clampedMag, 0.0));
 }

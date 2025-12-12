@@ -12,6 +12,8 @@ export class FDTDSimulation {
   private alphaBetaDt: number = 0.001; // Track dt used for alpha-beta calculation
   private readbackBuffer: GPUBuffer | null = null;
   private stagingBuffer: GPUBuffer | null = null;
+  private stagingBufferMapped: boolean = false; // Track if staging buffer is mapped
+  private readbackInProgress: boolean = false; // Prevent concurrent readback calls
 
   constructor(device: GPUDevice, textureSize: number = 512) {
     this.device = device;
@@ -145,7 +147,7 @@ export class FDTDSimulation {
       Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
   }
 
-  createTexture(name: string, width: number, height: number, format: GPUTextureFormat = 'rgba32float') {
+  createTexture(name: string, width: number, height: number, format: GPUTextureFormat = 'rgba16float') {
     const texture = this.device.createTexture({
       size: [width, height],
       format,
@@ -187,7 +189,7 @@ export class FDTDSimulation {
     // Create temporary texture for drawing
     const tempTexture = this.device.createTexture({
       size: [this.textureSize, this.textureSize],
-      format: 'rgba32float',
+      format: 'rgba16float',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
     });
 
@@ -363,7 +365,7 @@ export class FDTDSimulation {
     // Create temporary texture for output
     const tempTexture = this.device.createTexture({
       size: [this.textureSize, this.textureSize],
-      format: 'rgba32float',
+      format: 'rgba16float',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
     });
 
@@ -387,8 +389,9 @@ export class FDTDSimulation {
   }
 
   private decaySources() {
-    // Pre-compute decay factor: exp(-ln(10) * dt) ≈ 0.1^dt
-    const decayFactor = Math.exp(-Math.LN10 * this.dt);
+    // Pre-compute decay factor: exp(-ln(1000) * dt) ≈ 0.001^dt (very fast decay to prevent unbounded growth)
+    // With dt=0.001: decay ≈ 0.9931 per step, so after 1000 steps source field is ~0.37% of original
+    const decayFactor = Math.exp(-Math.LN10 * 3.0 * this.dt);
     const decayParams = new Float32Array([decayFactor, 0, 0, 0]);
     const paramsBuffer = this.device.createBuffer({
       size: 16,
@@ -399,7 +402,7 @@ export class FDTDSimulation {
     // Create temporary texture for decay operation
     const tempTexture = this.device.createTexture({
       size: [this.textureSize, this.textureSize],
-      format: 'rgba32float',
+      format: 'rgba16float',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
     });
 
@@ -482,61 +485,105 @@ export class FDTDSimulation {
    * Returns a promise with [Ex, Ey, Ez, magnitude]
    */
   async readFieldValueAt(x: number, y: number): Promise<Float32Array> {
-    if (!this.readbackBuffer || !this.stagingBuffer) {
-      throw new Error('Readback buffers not initialized');
+    // Serialize readback operations - only allow one at a time
+    if (this.readbackInProgress) {
+      return new Float32Array([0, 0, 0, 0]);
     }
+    this.readbackInProgress = true;
 
-    // Create parameters buffer with point coordinates
-    const paramsData = new Float32Array([x, y, this.textureSize, 0]);
-    const paramsBuffer = this.device.createBuffer({
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+    try {
+      if (!this.readbackBuffer || !this.stagingBuffer) {
+        throw new Error('Readback buffers not initialized');
+      }
 
-    // Create bind group for readFieldValue shader
-    const pipeline = this.pipelines.get('readFieldValue');
-    if (!pipeline) {
-      throw new Error('readFieldValue pipeline not found');
+      // Ensure staging buffer is unmapped before use
+      if (this.stagingBufferMapped) {
+        try {
+          this.stagingBuffer.unmap();
+          this.stagingBufferMapped = false;
+        } catch (e) {
+          // Ignore unmap errors
+        }
+      }
+
+      // Create parameters buffer with point coordinates
+      const paramsData = new Float32Array([x, y, this.textureSize, 0]);
+      const paramsBuffer = this.device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+
+      // Create bind group for readFieldValue shader
+      const pipeline = this.pipelines.get('readFieldValue');
+      if (!pipeline) {
+        throw new Error('readFieldValue pipeline not found');
+      }
+
+      const bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.textures.get('electricField')!.createView() },
+          { binding: 1, resource: { buffer: this.readbackBuffer } },
+          { binding: 2, resource: { buffer: paramsBuffer } },
+        ],
+      });
+
+      // Run compute shader to read field value
+      const commandEncoder = this.device.createCommandEncoder();
+      const computePass = commandEncoder.beginComputePass();
+      computePass.setPipeline(pipeline);
+      computePass.setBindGroup(0, bindGroup);
+      computePass.dispatchWorkgroups(1, 1, 1);
+      computePass.end();
+
+      // Copy from readback buffer to staging buffer
+      commandEncoder.copyBufferToBuffer(
+        this.readbackBuffer, 0,
+        this.stagingBuffer, 0,
+        16
+      );
+
+      this.device.queue.submit([commandEncoder.finish()]);
+      paramsBuffer.destroy();
+
+      // Wait for GPU to finish the submitted work before mapping
+      await this.device.queue.onSubmittedWorkDone();
+
+      // Map staging buffer and read data - with proper error handling
+      try {
+        await this.stagingBuffer.mapAsync(GPUMapMode.READ);
+        this.stagingBufferMapped = true;
+
+        const mappedData = this.stagingBuffer.getMappedRange();
+        const data = new Float32Array(4);
+        data.set(new Float32Array(mappedData));
+
+        this.stagingBuffer.unmap();
+        this.stagingBufferMapped = false;
+
+        return data;
+      } catch (error) {
+        console.error('Failed to map staging buffer:', error);
+        // Return zero field if readback fails
+        return new Float32Array([0, 0, 0, 0]);
+      }
+    } finally {
+      this.readbackInProgress = false;
     }
-
-    const bindGroup = this.device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.textures.get('electricField')!.createView() },
-        { binding: 1, resource: { buffer: this.readbackBuffer } },
-        { binding: 2, resource: { buffer: paramsBuffer } },
-      ],
-    });
-
-    // Run compute shader to read field value
-    const commandEncoder = this.device.createCommandEncoder();
-    const computePass = commandEncoder.beginComputePass();
-    computePass.setPipeline(pipeline);
-    computePass.setBindGroup(0, bindGroup);
-    computePass.dispatchWorkgroups(1, 1, 1);
-    computePass.end();
-
-    // Copy from readback buffer to staging buffer
-    commandEncoder.copyBufferToBuffer(
-      this.readbackBuffer, 0,
-      this.stagingBuffer, 0,
-      16
-    );
-
-    this.device.queue.submit([commandEncoder.finish()]);
-    paramsBuffer.destroy();
-
-    // Map staging buffer and read data
-    await this.stagingBuffer.mapAsync(GPUMapMode.READ);
-    const data = new Float32Array(this.stagingBuffer.getMappedRange().slice(0));
-    this.stagingBuffer.unmap();
-
-    return data;
   }
 
   // Add cleanup method
   destroy() {
+    // Unmap staging buffer if mapped
+    if (this.stagingBufferMapped && this.stagingBuffer) {
+      try {
+        this.stagingBuffer.unmap();
+      } catch (e) {
+        // Ignore unmap errors during cleanup
+      }
+    }
+
     for (const texture of this.textures.values()) {
       texture.destroy();
     }
