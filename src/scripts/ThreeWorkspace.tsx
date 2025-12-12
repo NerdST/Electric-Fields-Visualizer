@@ -269,6 +269,17 @@ const ThreeWorkspace: React.FC = () => {
 
   const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
   const [chargeStack, setChargeStack] = useState<string[]>([]);
+  const [positionInputs, setPositionInputs] = useState({ x: '', y: '', z: '' });
+  
+  useEffect(() => {
+    if (selectedCharge) {
+      setPositionInputs({
+        x: selectedCharge.position.x.toString(),
+        y: selectedCharge.position.y.toString(),
+        z: selectedCharge.position.z.toString(),
+      });
+    }
+  }, [selectedCharge]);
 
   // Voltage measurement points (computed via electricFieldAt)
   const [voltagePoints, setVoltagePoints] = useState<VoltagePoint[]>([]);
@@ -723,12 +734,19 @@ const ThreeWorkspace: React.FC = () => {
             <div style={{ marginBottom: '5px' }}>
               <label style={{ display: 'block', marginBottom: '2px' }}>Position X:</label>
               <input
-                type="number"
-                value={selectedCharge.position.x.toFixed(2)}
+                type="text"
+                value={positionInputs.x}
                 onChange={(e) => {
-                  const newPos = selectedCharge.position.clone();
-                  newPos.x = parseFloat(e.target.value);
-                  updateChargePosition(selectedCharge.id, newPos);
+                  const val = e.target.value;
+                  if (val === '' || /^-?\d*\.?\d*$/.test(val)) {
+                    setPositionInputs({ ...positionInputs, x: val });
+                    const numVal = parseFloat(val);
+                    if (!isNaN(numVal)) {
+                      const newPos = selectedCharge.position.clone();
+                      newPos.x = numVal;
+                      updateChargePosition(selectedCharge.id, newPos);
+                    }
+                  }
                 }}
                 style={{
                   width: '100%',
@@ -745,12 +763,19 @@ const ThreeWorkspace: React.FC = () => {
             <div style={{ marginBottom: '5px' }}>
               <label style={{ display: 'block', marginBottom: '2px' }}>Position Y:</label>
               <input
-                type="number"
-                value={selectedCharge.position.y.toFixed(2)}
+                type="text"
+                value={positionInputs.y}
                 onChange={(e) => {
-                  const newPos = selectedCharge.position.clone();
-                  newPos.y = parseFloat(e.target.value);
-                  updateChargePosition(selectedCharge.id, newPos);
+                  const val = e.target.value;
+                  if (val === '' || /^-?\d*\.?\d*$/.test(val)) {
+                    setPositionInputs({ ...positionInputs, y: val });
+                    const numVal = parseFloat(val);
+                    if (!isNaN(numVal)) {
+                      const newPos = selectedCharge.position.clone();
+                      newPos.y = numVal;
+                      updateChargePosition(selectedCharge.id, newPos);
+                    }
+                  }
                 }}
                 style={{
                   width: '100%',
@@ -767,12 +792,19 @@ const ThreeWorkspace: React.FC = () => {
             <div>
               <label style={{ display: 'block', marginBottom: '2px' }}>Position Z:</label>
               <input
-                type="number"
-                value={selectedCharge.position.z.toFixed(2)}
+                type="text"
+                value={positionInputs.z}
                 onChange={(e) => {
-                  const newPos = selectedCharge.position.clone();
-                  newPos.z = parseFloat(e.target.value);
-                  updateChargePosition(selectedCharge.id, newPos);
+                  const val = e.target.value;
+                  if (val === '' || /^-?\d*\.?\d*$/.test(val)) {
+                    setPositionInputs({ ...positionInputs, z: val });
+                    const numVal = parseFloat(val);
+                    if (!isNaN(numVal)) {
+                      const newPos = selectedCharge.position.clone();
+                      newPos.z = numVal;
+                      updateChargePosition(selectedCharge.id, newPos);
+                    }
+                  }
                 }}
                 style={{
                   width: '100%',
