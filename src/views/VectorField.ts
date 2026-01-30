@@ -1,6 +1,6 @@
 import * as THREE from 'three';
-import { electricFieldAt } from '../physics/Charge';
-import type { Charge } from '../physics/Charge';
+import { electricFieldAt } from '../models/Charge';
+import type { Charge } from '../models/Charge';
 
 export interface VectorFieldConfig {
   gridSize: number;
