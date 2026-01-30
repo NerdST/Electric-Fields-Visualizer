@@ -1,4 +1,4 @@
- import ThreeWorkspace from './scripts/ThreeWorkspace';
+ import ThreeWorkspace from '../controllers/ThreeWorkspace';
 
 const ThreeCanvas = () => {
   return (
