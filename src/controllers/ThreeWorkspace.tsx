@@ -2,11 +2,11 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
-import { createDefaultCharge, createCharge, electricFieldAt } from '../physics/Charge';
-import type { Charge } from '../physics/Charge';
-import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../visualization/VectorField';
-import { createVoltagePoint } from '../physics/VoltagePoint';
-import type { VoltagePoint } from '../physics/VoltagePoint';
+import { createDefaultCharge, createCharge, electricFieldAt } from '../models/Charge';
+import type { Charge } from '../models/Charge';
+import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../views/VectorField';
+import { createVoltagePoint } from '../models/VoltagePoint';
+import type { VoltagePoint } from '../models/VoltagePoint';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
