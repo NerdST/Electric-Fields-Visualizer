@@ -24,11 +24,12 @@ export class VectorFieldRenderer {
     this.scene = scene;
     this.config = config;
     
-    this.arrowGeometry = new THREE.ConeGeometry(0.05, 0.2, 8);
+    // Make arrows larger and more visible
+    this.arrowGeometry = new THREE.ConeGeometry(0.1, 0.5, 8);
     this.arrowMaterial = new THREE.MeshBasicMaterial({ 
       color: 0x00ff00,
       transparent: true,
-      opacity: 0.8
+      opacity: 0.9
     });
     
     this.createVectorField();
@@ -43,8 +44,12 @@ export class VectorFieldRenderer {
     this.gridPoints = this.generateGridPoints();
     const instanceCount = this.gridPoints.length;
     
-    if (instanceCount === 0) return;
+    if (instanceCount === 0) {
+      console.warn('VectorFieldRenderer: No grid points generated');
+      return;
+    }
 
+    console.log(`VectorFieldRenderer: Creating vector field with ${instanceCount} arrows`);
     this.arrowMesh = new THREE.InstancedMesh(
       this.arrowGeometry,
       this.arrowMaterial,
@@ -53,6 +58,7 @@ export class VectorFieldRenderer {
 
     this.updateVectorField();
     this.scene.add(this.arrowMesh);
+    console.log('VectorFieldRenderer: Arrow mesh added to scene, visible:', this.arrowMesh.visible);
   }
 
   private generateGridPoints(): THREE.Vector3[] {
@@ -77,19 +83,24 @@ export class VectorFieldRenderer {
   }
 
   private updateVectorField() {
-    if (!this.arrowMesh) return;
+    if (!this.arrowMesh) {
+      console.warn('VectorFieldRenderer: arrowMesh is null in updateVectorField');
+      return;
+    }
     const gridPoints = this.gridPoints;
     const matrix = new THREE.Matrix4();
     const position = new THREE.Vector3();
     const scale = new THREE.Vector3();
     const quaternion = new THREE.Quaternion();
 
+    let visibleCount = 0;
     for (let i = 0; i < gridPoints.length; i++) {
       const point = gridPoints[i];
       const fieldResult = electricFieldAt(point, this.charges);
       const field = fieldResult.field;
 
       if (field.length() < 1e-6) {
+        // Hide arrow for zero/very small fields
         matrix.makeScale(0, 0, 0);
         this.arrowMesh.setMatrixAt(i, matrix);
         continue;
@@ -97,15 +108,18 @@ export class VectorFieldRenderer {
 
       let arrowLength = field.length();
       if (this.config.showDirectionOnly) {
-        arrowLength = 0.3; 
+        arrowLength = 1.0; // Base arrow length for direction-only mode (scaled to geometry height 0.5)
       } else {
-        // CHANGE: Scale field magnitude more reasonably
+        // Scale field magnitude more reasonably
         const normalizedMagnitude = Math.min(arrowLength / this.config.maxFieldMagnitude, 1);
-        arrowLength = Math.max(normalizedMagnitude * this.config.arrowScale, 0.1); // Minimize visible size
+        // Ensure minimum visible size - scale relative to base geometry height (0.5)
+        // arrowLength is a multiplier for the base geometry height of 0.5
+        arrowLength = Math.max(normalizedMagnitude * this.config.arrowScale, 0.5);
       }
 
       position.copy(point);
       
+      // Scale the arrow: base geometry height is 0.5, so scale by arrowLength
       scale.set(1, arrowLength, 1);
       
       const direction = field.clone().normalize();
@@ -113,14 +127,25 @@ export class VectorFieldRenderer {
 
       matrix.compose(position, quaternion, scale);
       this.arrowMesh.setMatrixAt(i, matrix);
+      visibleCount++;
     }
 
     this.arrowMesh.instanceMatrix.needsUpdate = true;
+    console.log(`VectorFieldRenderer: Updated ${visibleCount} visible arrows out of ${gridPoints.length} total`);
   }
 
   public updateCharges(charges: Charge[]) {
     this.charges = charges;
-    if (!this.arrowMesh) return;
+    
+    // Ensure mesh exists
+    if (!this.arrowMesh) {
+      console.warn('VectorFieldRenderer: arrowMesh is null, recreating...');
+      this.createVectorField();
+      if (!this.arrowMesh) {
+        console.error('VectorFieldRenderer: Failed to create arrow mesh');
+        return;
+      }
+    }
     
     const wasVisible = this.arrowMesh.visible;
     const wasInScene = this.scene.children.includes(this.arrowMesh);
@@ -130,6 +155,7 @@ export class VectorFieldRenderer {
     if (this.arrowMesh) {
       this.arrowMesh.visible = wasVisible;
       if (!wasInScene && wasVisible) {
+        console.log('VectorFieldRenderer: Adding arrow mesh to scene in updateCharges');
         this.scene.add(this.arrowMesh);
       }
     }
@@ -155,8 +181,13 @@ export class VectorFieldRenderer {
     if (this.arrowMesh) {
       console.log('Setting arrowMesh.visible to:', visible);
       this.arrowMesh.visible = visible;
+      // Ensure mesh is in scene
+      if (visible && !this.scene.children.includes(this.arrowMesh)) {
+        console.log('VectorFieldRenderer: Adding arrow mesh to scene');
+        this.scene.add(this.arrowMesh);
+      }
     } else {
-      console.log('arrowMesh is null!');
+      console.warn('VectorFieldRenderer: arrowMesh is null! Cannot set visibility.');
     }
   }
 
@@ -172,13 +203,13 @@ export class VectorFieldRenderer {
 
 export function createDefaultVectorFieldConfig(): VectorFieldConfig {
   return {
-    gridSize: 8,
+    gridSize: 10, // Increased from 8 for better visibility
     bounds: {
       min: new THREE.Vector3(-5, -5, -5),
       max: new THREE.Vector3(5, 5, 5)
     },
-    arrowScale: 2.0,
-    maxFieldMagnitude: 1e4,
+    arrowScale: 1.0, // Adjusted for better scaling
+    maxFieldMagnitude: 1e5, // Increased to handle larger fields
     showDirectionOnly: false
   };
 }
