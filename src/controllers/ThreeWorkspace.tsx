@@ -295,7 +295,6 @@ const ThreeWorkspace: React.FC = () => {
       const vectorFieldConfig = createDefaultVectorFieldConfig();
       const vfRenderer = new VectorFieldRenderer(sceneManager.scene, vectorFieldConfig);
       vfRenderer.updateCharges(chargesState);
-      // Set visibility after updating charges to ensure mesh exists
       vfRenderer.setVisible(showVectorField);
       vectorFieldRendererRef.current = vfRenderer;
       vectorFieldInitialized.current = true;

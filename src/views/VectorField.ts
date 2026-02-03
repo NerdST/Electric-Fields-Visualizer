@@ -56,6 +56,9 @@ export class VectorFieldRenderer {
       instanceCount
     );
 
+    // Makr sure the mesh is visible by default
+    this.arrowMesh.visible = true;
+    
     this.updateVectorField();
     this.scene.add(this.arrowMesh);
     console.log('VectorFieldRenderer: Arrow mesh added to scene, visible:', this.arrowMesh.visible);
@@ -137,7 +140,6 @@ export class VectorFieldRenderer {
   public updateCharges(charges: Charge[]) {
     this.charges = charges;
     
-    // Ensure mesh exists
     if (!this.arrowMesh) {
       console.warn('VectorFieldRenderer: arrowMesh is null, recreating...');
       this.createVectorField();
@@ -147,14 +149,14 @@ export class VectorFieldRenderer {
       }
     }
     
-    const wasVisible = this.arrowMesh.visible;
-    const wasInScene = this.scene.children.includes(this.arrowMesh);
+    const wasVisible = this.arrowMesh ? this.arrowMesh.visible : true;
+    const wasInScene = this.arrowMesh ? this.scene.children.includes(this.arrowMesh) : false;
     
     this.updateVectorField();
     
     if (this.arrowMesh) {
       this.arrowMesh.visible = wasVisible;
-      if (!wasInScene && wasVisible) {
+      if (wasVisible && !wasInScene) {
         console.log('VectorFieldRenderer: Adding arrow mesh to scene in updateCharges');
         this.scene.add(this.arrowMesh);
       }
