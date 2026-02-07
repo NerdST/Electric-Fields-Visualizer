@@ -1,4 +1,12 @@
 // Enhanced FDTD Simulation class
+export type OscillatingSource = {
+  position: [number, number];
+  radius: number;
+  amplitude: number;
+  frequency: number;
+  phase: number;
+};
+
 export class FDTDSimulation {
   private device: GPUDevice;
   private pipelines: Map<string, GPUComputePipeline> = new Map();
@@ -20,6 +28,10 @@ export class FDTDSimulation {
   private tempTexture: GPUTexture | null = null;
   private injectParamsBuffer: GPUBuffer | null = null;
   private decayParamsBuffer: GPUBuffer | null = null;
+  private oscillatorBuffer: GPUBuffer | null = null;
+  private oscillatingSources: OscillatingSource[] = [];
+  private oscillatorBufferDirty: boolean = false;
+  private maxOscillators: number = 64;
 
   constructor(device: GPUDevice, textureSize: number = 512) {
     this.device = device;
@@ -119,6 +131,12 @@ export class FDTDSimulation {
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       label: 'decay_params_buffer'
+    });
+
+    this.oscillatorBuffer = this.device.createBuffer({
+      size: this.maxOscillators * 32,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      label: 'oscillator_source_buffer'
     });
   }
 
@@ -389,7 +407,16 @@ export class FDTDSimulation {
     // Swap source field buffers
     this.swapSourceBuffers();
 
-    const sourceParams = new Float32Array([this.dt, 0, 0, 0]);
+    if (this.oscillatorBufferDirty) {
+      this.updateOscillatorBuffer();
+    }
+
+    const sourceParams = new Float32Array([
+      this.dt,
+      this.time,
+      this.oscillatingSources.length,
+      0,
+    ]);
     this.device.queue.writeBuffer(this.injectParamsBuffer!, 0, sourceParams);
 
     const bindGroup = this.device.createBindGroup({
@@ -399,6 +426,7 @@ export class FDTDSimulation {
         { binding: 1, resource: this.textures.get('electricFieldNext')!.createView() }, // Previous electric field
         { binding: 2, resource: { buffer: this.injectParamsBuffer! } },
         { binding: 3, resource: this.tempTexture!.createView() },
+        { binding: 4, resource: { buffer: this.oscillatorBuffer! } },
       ],
     });
 
@@ -488,6 +516,50 @@ export class FDTDSimulation {
 
   getTime() {
     return this.time;
+  }
+
+  setOscillatingSources(sources: OscillatingSource[]) {
+    if (sources.length > this.maxOscillators) {
+      throw new Error(`Too many oscillating sources (max ${this.maxOscillators})`);
+    }
+    this.oscillatingSources = sources.slice();
+    this.oscillatorBufferDirty = true;
+  }
+
+  addOscillatingSource(source: OscillatingSource) {
+    if (this.oscillatingSources.length + 1 > this.maxOscillators) {
+      throw new Error(`Too many oscillating sources (max ${this.maxOscillators})`);
+    }
+    this.oscillatingSources.push(source);
+    this.oscillatorBufferDirty = true;
+  }
+
+  clearOscillatingSources() {
+    this.oscillatingSources = [];
+    this.oscillatorBufferDirty = true;
+  }
+
+  private updateOscillatorBuffer() {
+    if (!this.oscillatorBuffer) return;
+
+    const strideFloats = 8;
+    const data = new Float32Array(this.maxOscillators * strideFloats);
+
+    for (let i = 0; i < this.oscillatingSources.length; i += 1) {
+      const source = this.oscillatingSources[i];
+      const baseIndex = i * strideFloats;
+      data[baseIndex] = source.position[0];
+      data[baseIndex + 1] = source.position[1];
+      data[baseIndex + 2] = source.radius;
+      data[baseIndex + 3] = source.amplitude;
+      data[baseIndex + 4] = source.frequency;
+      data[baseIndex + 5] = source.phase;
+      data[baseIndex + 6] = 0;
+      data[baseIndex + 7] = 0;
+    }
+
+    this.device.queue.writeBuffer(this.oscillatorBuffer, 0, data);
+    this.oscillatorBufferDirty = false;
   }
 
   /**
@@ -643,6 +715,9 @@ export class FDTDSimulation {
     }
     if (this.decayParamsBuffer) {
       this.decayParamsBuffer.destroy();
+    }
+    if (this.oscillatorBuffer) {
+      this.oscillatorBuffer.destroy();
     }
   }
 }

@@ -1,5 +1,6 @@
 import React from 'react';
 import { FDTDSimulation } from '../simulation';
+import type { OscillatingSource } from '../simulation';
 import { initializeWebGPUWithFDTD, setupFDTDRenderPipeline, updateFDTDRender } from '../webgpu';
 
 // Global variables
@@ -105,7 +106,7 @@ const injectStaticCharge = async (position: [number, number], charge: number) =>
   const drawParams = new Float32Array([
     position[0], position[1], // position in [0,1] space
     pixelRadius, pixelRadius, // radius
-    0, 0, charge * 10.0, 0, // z-component value (higher since injected once)
+    0, 0, charge * 1.0, 0, // z-component value (higher since injected once)
     0, 0, 1, 1, // Replace mode: set value (don't accumulate)
   ]);
 
@@ -176,6 +177,8 @@ const ChargeCanvas = () => {
   const [probeX, setProbeX] = React.useState(0.5);
   const [probeY, setProbeY] = React.useState(0.5);
   const [fieldValue, setFieldValue] = React.useState<{ Ex: number, Ey: number, Ez: number, magnitude: number } | null>(null);
+  const [sourceType, setSourceType] = React.useState<'static' | 'oscillating'>('static');
+  const sourceTypeRef = React.useRef<'static' | 'oscillating'>('static');
 
   // Initialize simulation once on mount
   React.useEffect(() => {
@@ -190,10 +193,24 @@ const ChargeCanvas = () => {
           const x = (event.clientX - rect.left) / rect.width; // [0, 1]
           const y = 1 - ((event.clientY - rect.top) / rect.height); // [0, 1] with y-flip
 
-          // Inject charge once immediately
-          injectStaticCharge([x, y], 1.0);
-          staticCharges.push([x, y, 1.0]);
-          console.log(`Added static charge at (${x}, ${y}), total charges: ${staticCharges.length}`);
+          if (sourceTypeRef.current === 'static') {
+            // Inject charge once immediately
+            injectStaticCharge([x, y], 1.0);
+            staticCharges.push([x, y, 1.0]);
+            console.log(`Added static charge at (${x}, ${y}), total charges: ${staticCharges.length}`);
+          } else {
+            const gridSize = fdtdSimulation.getTextureSize();
+            const pixelRadius = 2.0 / gridSize;
+            const oscillatingSource: OscillatingSource = {
+              position: [x, y],
+              radius: pixelRadius,
+              amplitude: 2.0,
+              frequency: 5.0,
+              phase: 0.0,
+            };
+            fdtdSimulation.addOscillatingSource(oscillatingSource);
+            console.log(`Added oscillating source at (${x}, ${y})`);
+          }
         }
       }
     };
@@ -296,7 +313,7 @@ const ChargeCanvas = () => {
         position: 'absolute',
         top: '20px'
       }}>
-        Click to add static point charges
+        Click to add {sourceType === 'static' ? 'static' : 'oscillating'} sources
       </div>
       <div style={{
         position: 'absolute',
@@ -317,6 +334,37 @@ const ChargeCanvas = () => {
           border: '1px solid #2196F3'
         }}>
           🔄 Step: 0
+        </div>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          fontFamily: 'monospace',
+          fontSize: '12px',
+          color: '#333',
+          backgroundColor: 'rgba(255, 255, 255, 0.9)',
+          padding: '6px 8px',
+          borderRadius: '4px',
+          border: '1px solid #ccc'
+        }}>
+          <label htmlFor="source-type">Source:</label>
+          <select
+            id="source-type"
+            value={sourceType}
+            onChange={(event) => {
+              const nextType = event.target.value as 'static' | 'oscillating';
+              setSourceType(nextType);
+              sourceTypeRef.current = nextType;
+            }}
+            style={{
+              fontFamily: 'monospace',
+              fontSize: '12px',
+              padding: '2px 4px'
+            }}
+          >
+            <option value="static">Static</option>
+            <option value="oscillating">Oscillating</option>
+          </select>
         </div>
         {/* <div style={{
           fontSize: '11px',

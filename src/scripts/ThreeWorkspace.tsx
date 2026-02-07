@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { createDefaultCharge } from '../physics/Charge';
 import type { Charge } from '../physics/Charge';
-import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../visualization/VectorField';
+// import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../visualization/VectorField';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -67,7 +67,7 @@ function animate() {
 
 const ThreeWorkspace: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [vectorFieldRenderer, setVectorFieldRenderer] = useState<VectorFieldRenderer | null>(null);
+  // const [vectorFieldRenderer, setVectorFieldRenderer] = useState<VectorFieldRenderer | null>(null);
   const [showVectorField, setShowVectorField] = useState(true);
 
   useEffect(() => {
@@ -85,10 +85,10 @@ const ThreeWorkspace: React.FC = () => {
     controls.enableDamping = true;
 
     // Initialize vector field renderer
-    const vectorFieldConfig = createDefaultVectorFieldConfig();
-    const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
-    vfRenderer.updateCharges(charges);
-    setVectorFieldRenderer(vfRenderer);
+    // const vectorFieldConfig = createDefaultVectorFieldConfig();
+    // const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
+    // vfRenderer.updateCharges(charges);
+    // setVectorFieldRenderer(vfRenderer);
 
     const onResize = () => {
       const width = container.clientWidth || window.innerWidth;
@@ -108,24 +108,24 @@ const ThreeWorkspace: React.FC = () => {
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
-      if (vectorFieldRenderer) {
-        vectorFieldRenderer.dispose();
-      }
+      // if (vectorFieldRenderer) {
+      //   vectorFieldRenderer.dispose();
+      // }
     };
   }, []);
 
   const toggleVectorField = () => {
     const newVisibility = !showVectorField;
     setShowVectorField(newVisibility);
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.setVisible(newVisibility);
-    }
+    // if (vectorFieldRenderer) {
+    //   vectorFieldRenderer.setVisible(newVisibility);
+    // }
   };
 
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh' }}>
       <div ref={containerRef} style={{ width: '100%', height: '100%', background: '#282c34' }} />
-      
+
       {/* Simple control panel */}
       <div style={{
         position: 'absolute',
@@ -140,7 +140,7 @@ const ThreeWorkspace: React.FC = () => {
       }}>
         <div>Electric Field Visualizer</div>
         <div>Charges: {charges.length}</div>
-        <button 
+        <button
           onClick={toggleVectorField}
           style={{
             marginTop: '5px',
