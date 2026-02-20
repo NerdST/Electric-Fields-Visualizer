@@ -5,6 +5,7 @@ import { WebGPURenderer } from 'three/webgpu';
 import { createDefaultCharge, createCharge, electricFieldAt } from '../models/Charge';
 import type { Charge } from '../models/Charge';
 import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../views/VectorField';
+import { FieldLineRenderer, createDefaultFieldLineConfig } from '../views/FieldLines';
 import { createVoltagePoint } from '../models/VoltagePoint';
 import type { VoltagePoint } from '../models/VoltagePoint';
 
@@ -259,6 +260,9 @@ const ThreeWorkspace: React.FC = () => {
   const [vectorFieldRenderer, setVectorFieldRenderer] =
     useState<VectorFieldRenderer | null>(null);
   const [showVectorField, setShowVectorField] = useState(true);
+  const [fieldLineRenderer, setFieldLineRenderer] =
+    useState<FieldLineRenderer | null>(null);
+  const [showFieldLines, setShowFieldLines] = useState(false);
 
   // Charge state mirrors global `charges`
   const [chargesState, setChargesState] = useState<Charge[]>(charges);
@@ -309,6 +313,7 @@ const ThreeWorkspace: React.FC = () => {
   const [hoverPosition, setHoverPosition] = useState<THREE.Vector3 | null>(null);
 
   const vectorFieldInitialized = useRef(false);
+  const fieldLineInitialized = useRef(false);
   const vfUpdateScheduled = useRef(false);
 
   const scheduleVectorFieldUpdate = useCallback(
@@ -325,9 +330,13 @@ const ThreeWorkspace: React.FC = () => {
             vectorFieldRenderer.setVisible(true);
           }
         }
+        // Update field lines as well
+        if (fieldLineRenderer) {
+          fieldLineRenderer.updateCharges(nextCharges);
+        }
       });
     },
-    [vectorFieldRenderer, showVectorField],
+    [vectorFieldRenderer, fieldLineRenderer, showVectorField],
   );
 
   // Charge management
@@ -508,6 +517,15 @@ const ThreeWorkspace: React.FC = () => {
       vectorFieldInitialized.current = true;
     }
 
+    if (!fieldLineInitialized.current) {
+      const fieldLineConfig = createDefaultFieldLineConfig();
+      const flRenderer = new FieldLineRenderer(scene, fieldLineConfig);
+      flRenderer.updateCharges(charges);
+      flRenderer.setVisible(showFieldLines);
+      setFieldLineRenderer(flRenderer);
+      fieldLineInitialized.current = true;
+    }
+
     const onResize = () => {
       const width = container.clientWidth || window.innerWidth;
       const height = container.clientHeight || window.innerHeight;
@@ -559,8 +577,11 @@ const ThreeWorkspace: React.FC = () => {
       if (vectorFieldRenderer) {
         vectorFieldRenderer.dispose();
       }
+      if (fieldLineRenderer) {
+        fieldLineRenderer.dispose();
+      }
     };
-  }, [handleMouseClick, vectorFieldRenderer]);
+  }, [handleMouseClick, vectorFieldRenderer, fieldLineRenderer, showFieldLines]);
 
   // Keep voltage point meshes in sync with state
   useEffect(() => {
@@ -572,6 +593,14 @@ const ThreeWorkspace: React.FC = () => {
     setShowVectorField(newVisibility);
     if (vectorFieldRenderer) {
       vectorFieldRenderer.setVisible(newVisibility);
+    }
+  };
+
+  const toggleFieldLines = () => {
+    const newVisibility = !showFieldLines;
+    setShowFieldLines(newVisibility);
+    if (fieldLineRenderer) {
+      fieldLineRenderer.setVisible(newVisibility);
     }
   };
 
@@ -691,9 +720,25 @@ const ThreeWorkspace: React.FC = () => {
               cursor: 'pointer',
               fontSize: '11px',
               width: '100%',
+              marginBottom: '5px',
             }}
           >
             {showVectorField ? 'Hide' : 'Show'} Vector Field
+          </button>
+          <button 
+            onClick={toggleFieldLines}
+            style={{
+              padding: '8px 12px',
+              background: showFieldLines ? '#4CAF50' : '#f44336',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '11px',
+              width: '100%',
+            }}
+          >
+            {showFieldLines ? 'Hide' : 'Show'} Field Lines
           </button>
         </div>
 
