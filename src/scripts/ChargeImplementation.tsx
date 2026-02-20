@@ -17,14 +17,31 @@ let simulationTimer: number | null = null;
 let simulationStepCount = 0; // Track total simulation steps
 // Store all static point charges as [x, y, charge] tuples
 const staticCharges: Array<[number, number, number]> = [];
+const CELL_SIZE_OPTIONS_NM = [1, 2, 5, 10, 20, 50, 100];
+
+// NOTE: The FDTD solver is currently non-dimensional.
+// We map UI "nm" values to stable simulation cell units instead of literal meters.
+// 5 nm maps to the previous default cellSize (0.01).
+const nmToSimulationCellSize = (valueNm: number) => valueNm * 0.002;
+
+const applyCanvasZoom = (zoomLevel: number, textureSize: number) => {
+  const canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement | null;
+  if (!canvas) return;
+
+  const clampedZoom = Math.max(1, Math.min(12, zoomLevel));
+  const canvasPixels = Math.round(textureSize * clampedZoom);
+  canvas.style.width = `${canvasPixels}px`;
+  canvas.style.height = `${canvasPixels}px`;
+};
 
 // Updated initialization - Fixed device scope and error handling
-const initialize = async () => {
+const initialize = async (initialCellSize: number, initialZoom: number) => {
   try {
     console.log('Initializing WebGPU with FDTD...');
     const { device: gpuDevice, fdtdSim } = await initializeWebGPUWithFDTD();
     device = gpuDevice; // Set global device reference
     fdtdSimulation = fdtdSim;
+    fdtdSimulation.setCellSize(initialCellSize);
 
     console.log('WebGPU and FDTD initialized successfully');
 
@@ -34,6 +51,7 @@ const initialize = async () => {
     renderPipeline = renderSetup.renderPipeline;
     renderBindGroupLayout = renderSetup.renderBindGroupLayout;
     renderConfigBuffer = renderSetup.renderConfigBuffer;
+    applyCanvasZoom(initialZoom, fdtdSim.getTextureSize());
 
     console.log('FDTD simulation ready. Starting loops...');
 
@@ -178,11 +196,13 @@ const ChargeCanvas = () => {
   const [probeY, setProbeY] = React.useState(0.5);
   const [fieldValue, setFieldValue] = React.useState<{ Ex: number, Ey: number, Ez: number, magnitude: number } | null>(null);
   const [sourceType, setSourceType] = React.useState<'static' | 'oscillating'>('static');
+  const [cellSizeNm, setCellSizeNm] = React.useState(5);
+  const [zoomLevel, setZoomLevel] = React.useState(4);
   const sourceTypeRef = React.useRef<'static' | 'oscillating'>('static');
 
   // Initialize simulation once on mount
   React.useEffect(() => {
-    initialize();
+    initialize(nmToSimulationCellSize(cellSizeNm), zoomLevel);
 
     // Add mouse handler to place static point charges on click
     const handleMouseClick = (event: MouseEvent) => {
@@ -236,6 +256,17 @@ const ChargeCanvas = () => {
       }
     };
   }, []);
+
+  React.useEffect(() => {
+    if (fdtdSimulation) {
+      fdtdSimulation.setCellSize(nmToSimulationCellSize(cellSizeNm));
+    }
+  }, [cellSizeNm]);
+
+  React.useEffect(() => {
+    const textureSize = fdtdSimulation ? fdtdSimulation.getTextureSize() : 128;
+    applyCanvasZoom(zoomLevel, textureSize);
+  }, [zoomLevel]);
 
   // Separate effect for reading probe values when position changes
   React.useEffect(() => {
@@ -365,6 +396,60 @@ const ChargeCanvas = () => {
             <option value="static">Static</option>
             <option value="oscillating">Oscillating</option>
           </select>
+        </div>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          fontFamily: 'monospace',
+          fontSize: '12px',
+          color: '#333',
+          backgroundColor: 'rgba(255, 255, 255, 0.9)',
+          padding: '6px 8px',
+          borderRadius: '4px',
+          border: '1px solid #ccc'
+        }}>
+          <label htmlFor="cell-size">Cell:</label>
+          <select
+            id="cell-size"
+            value={cellSizeNm}
+            onChange={(event) => setCellSizeNm(Number(event.target.value))}
+            style={{
+              fontFamily: 'monospace',
+              fontSize: '12px',
+              padding: '2px 4px'
+            }}
+          >
+            {CELL_SIZE_OPTIONS_NM.map((option) => (
+              <option key={option} value={option}>{option} nm</option>
+            ))}
+          </select>
+          <span style={{ fontSize: '10px', color: '#777' }} title="Relative simulation spacing scale">
+            (scale)
+          </span>
+        </div>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          fontFamily: 'monospace',
+          fontSize: '12px',
+          color: '#333',
+          backgroundColor: 'rgba(255, 255, 255, 0.9)',
+          padding: '6px 8px',
+          borderRadius: '4px',
+          border: '1px solid #ccc'
+        }}>
+          <label htmlFor="canvas-zoom">Zoom: {zoomLevel.toFixed(1)}x</label>
+          <input
+            id="canvas-zoom"
+            type="range"
+            min="1"
+            max="12"
+            step="0.5"
+            value={zoomLevel}
+            onChange={(event) => setZoomLevel(Number(event.target.value))}
+          />
         </div>
         {/* <div style={{
           fontSize: '11px',

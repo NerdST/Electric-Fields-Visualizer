@@ -162,10 +162,8 @@ export const updateFDTDRender = (
   }
 
   // Config values: brightness, electricEnergyFactor, magneticEnergyFactor, time
-  // Balanced brightness for visibility without oversaturation
-  const cellSize = 0.01; // Match simulation cellSize
-  const brightnessBase = 0.1; // Balanced value for good visibility
-  const brightness = (brightnessBase * brightnessBase) / (cellSize * cellSize);
+  // Keep brightness independent from cell spacing to avoid saturation when UI spacing changes.
+  const brightness = 0.1;
 
   const configData = new Float32Array([
     brightness, // brightness calculated from cellSize

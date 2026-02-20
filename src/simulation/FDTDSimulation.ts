@@ -16,6 +16,7 @@ export class FDTDSimulation {
   private textureSize: number;
   private dt: number = 0.001;
   private cellSize: number = 0.01;
+  private courantFactor: number = 0.1;
   private time: number = 0;
   private alphaBetaDt: number = 0.001; // Track dt used for alpha-beta calculation
   private readbackBuffer: GPUBuffer | null = null;
@@ -36,11 +37,28 @@ export class FDTDSimulation {
   constructor(device: GPUDevice, textureSize: number = 512) {
     this.device = device;
     this.textureSize = textureSize;
+    this.courantFactor = this.dt / this.cellSize;
     this.initializeSampler();
   }
 
   public getTextureSize(): number {
     return this.textureSize;
+  }
+
+  public getCellSize(): number {
+    return this.cellSize;
+  }
+
+  public setCellSize(cellSize: number) {
+    if (!Number.isFinite(cellSize) || cellSize <= 0) {
+      throw new Error(`Invalid cell size: ${cellSize}`);
+    }
+    if (this.cellSize === cellSize) {
+      return;
+    }
+    this.cellSize = cellSize;
+    this.dt = this.courantFactor * this.cellSize;
+    this.alphaBetaDt = Number.NaN;
   }
 
   private initializeSampler() {
