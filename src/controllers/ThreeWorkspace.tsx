@@ -41,6 +41,7 @@ const ThreeWorkspace: React.FC = () => {
   const isEditingPositionRef = useRef(false);
   const vectorFieldInitialized = useRef(false);
   const vfUpdateScheduled = useRef(false);
+  const handleMouseClickRef = useRef<((event: MouseEvent) => void) | null>(null);
 
   useEffect(() => {
     chargesRef.current = chargesState;
@@ -227,8 +228,9 @@ const ThreeWorkspace: React.FC = () => {
     }
   }, []);
 
-  const handleMouseClick = useCallback(
-    (event: MouseEvent) => {
+  // Update the ref whenever selectCharge or chargesState changes
+  useEffect(() => {
+    handleMouseClickRef.current = (event: MouseEvent) => {
       if (!sceneManagerRef.current || !sceneManagerRef.current.controls) return;
 
       const renderer = sceneManagerRef.current.renderer;
@@ -261,12 +263,11 @@ const ThreeWorkspace: React.FC = () => {
         setSelectedCharge(null);
         selectedChargeIdRef.current = null;
         if (chargeMeshManagerRef.current) {
-          chargeMeshManagerRef.current.updateCharges(chargesState, null);
+          chargeMeshManagerRef.current.updateCharges(chargesRef.current, null);
         }
       }
-    },
-    [selectCharge, chargesState],
-  );
+    };
+  }, [selectCharge]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -308,7 +309,14 @@ const ThreeWorkspace: React.FC = () => {
 
     onResize();
     window.addEventListener('resize', onResize);
-    sceneManager.renderer.domElement.addEventListener('click', handleMouseClick);
+    
+    // Use a wrapper function that calls the ref
+    const clickHandler = (event: MouseEvent) => {
+      if (handleMouseClickRef.current) {
+        handleMouseClickRef.current(event);
+      }
+    };
+    sceneManager.renderer.domElement.addEventListener('click', clickHandler);
 
     // Hover voltage tracking over plane y = 0
     const moveRaycaster = new THREE.Raycaster();
@@ -346,7 +354,7 @@ const ThreeWorkspace: React.FC = () => {
 
     return () => {
       window.removeEventListener('resize', onResize);
-      sceneManager.renderer.domElement.removeEventListener('click', handleMouseClick);
+      sceneManager.renderer.domElement.removeEventListener('click', clickHandler);
       sceneManager.renderer.domElement.removeEventListener('mousemove', onMouseMove);
       
       if (animationFrameRef.current) {
@@ -369,7 +377,7 @@ const ThreeWorkspace: React.FC = () => {
         voltagePointMeshManagerRef.current.dispose();
       }
     };
-  }, [handleMouseClick]);
+  }, []);
 
   // Keep voltage point meshes in sync with state
   useEffect(() => {
@@ -377,6 +385,13 @@ const ThreeWorkspace: React.FC = () => {
       voltagePointMeshManagerRef.current.updateVoltagePoints(voltagePoints, chargesRef.current);
     }
   }, [voltagePoints]);
+
+  // Sync vector field visibility when showVectorField changes
+  useEffect(() => {
+    if (vectorFieldRendererRef.current) {
+      vectorFieldRendererRef.current.setVisible(showVectorField);
+    }
+  }, [showVectorField]);
 
   const toggleVectorField = () => {
     const newVisibility = !showVectorField;
