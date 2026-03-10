@@ -39,8 +39,7 @@ const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
 const chargeGeometry = new THREE.SphereGeometry(0.2, 16, 16);
 const positiveChargeMaterial = new THREE.MeshStandardMaterial({ color: 0xff4444 });
 const negativeChargeMaterial = new THREE.MeshStandardMaterial({ color: 0x4444ff });
-const voltageOrbGeometry = new THREE.SphereGeometry(0.15, 16, 16);
-const voltageOrbMaterial = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
+
 
 // Add some default charges
 const charge1 = createDefaultCharge('charge-1');
