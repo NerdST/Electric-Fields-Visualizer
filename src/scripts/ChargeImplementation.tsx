@@ -143,43 +143,42 @@ const injectStaticCharge = async (position: [number, number], charge: number) =>
   });
   device.queue.writeBuffer(paramsBuffer, 0, drawParams);
 
-  const tempTexture = device.createTexture({
-    size: [gridSize, gridSize],
-    format: 'rgba16float',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
-  });
+  // Stamp each ping-pong electric buffer independently.
+  // This prevents collapsing both buffers to one state when adding additional charges.
+  const targets: Array<'electricField' | 'electricFieldNext'> = ['electricField', 'electricFieldNext'];
+  for (const targetName of targets) {
+    const targetTexture = fdtdSimulation.getTexture(targetName);
+    if (!targetTexture) continue;
 
-  const bindGroup = device.createBindGroup({
-    layout: fdtdSimulation.getPipeline('drawEllipse')!.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: fdtdSimulation.getTexture('electricField')!.createView() },
-      { binding: 1, resource: { buffer: paramsBuffer } },
-      { binding: 2, resource: tempTexture.createView() },
-    ],
-  });
+    const tempTexture = device.createTexture({
+      size: [gridSize, gridSize],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
 
-  fdtdSimulation.runComputePass('drawEllipse', bindGroup, Math.ceil(gridSize / 8), Math.ceil(gridSize / 8));
+    const bindGroup = device.createBindGroup({
+      layout: fdtdSimulation.getPipeline('drawEllipse')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: targetTexture.createView() },
+        { binding: 1, resource: { buffer: paramsBuffer } },
+        { binding: 2, resource: tempTexture.createView() },
+      ],
+    });
 
-  // Copy result back into both electric buffers (double buffer)
-  const commandEncoder = device.createCommandEncoder();
-  commandEncoder.copyTextureToTexture(
-    { texture: tempTexture },
-    { texture: fdtdSimulation.getTexture('electricField')! },
-    [gridSize, gridSize]
-  );
-  const nextElectricTex = fdtdSimulation.getTexture('electricFieldNext');
-  if (nextElectricTex) {
+    fdtdSimulation.runComputePass('drawEllipse', bindGroup, Math.ceil(gridSize / 8), Math.ceil(gridSize / 8));
+
+    const commandEncoder = device.createCommandEncoder();
     commandEncoder.copyTextureToTexture(
       { texture: tempTexture },
-      { texture: nextElectricTex },
+      { texture: targetTexture },
       [gridSize, gridSize]
     );
+    device.queue.submit([commandEncoder.finish()]);
+    tempTexture.destroy();
   }
-  device.queue.submit([commandEncoder.finish()]);
+
   // Ensure GPU has finished before cleaning up
   await device.queue.onSubmittedWorkDone();
-
-  tempTexture.destroy();
   paramsBuffer.destroy();
 };
 
