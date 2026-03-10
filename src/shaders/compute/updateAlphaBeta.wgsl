@@ -28,15 +28,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let permittivity = mat.y;
   let conductivity = mat.z;
 
-  let cEl = conductivity * sim.dt / (2.0 * permeability);
+  // Electric update scales with permittivity.
+  let cEl = conductivity * sim.dt / (2.0 * permittivity);
   let dEl = 1.0 / (1.0 + cEl);
   let alphaEl = (1.0 - cEl) * dEl;
-  let betaEl = (sim.c0 * sim.dt) / (permeability * sim.cellSize) * dEl;
+  let betaEl = (sim.c0 * sim.dt) / (permittivity * sim.cellSize) * dEl;
 
-  let cMag = conductivity * sim.dt / (2.0 * permittivity);
+  // Magnetic update scales with permeability.
+  let cMag = conductivity * sim.dt / (2.0 * permeability);
   let dMag = 1.0 / (1.0 + cMag);
   let alphaMag = (1.0 - cMag) * dMag;
-  let betaMag = (sim.c0 * sim.dt) / (permittivity * sim.cellSize) * dMag;
+  let betaMag = (sim.c0 * sim.dt) / (permeability * sim.cellSize) * dMag;
 
   textureStore(outTex, coord, vec4<f32>(alphaEl, betaEl, alphaMag, betaMag));
 }

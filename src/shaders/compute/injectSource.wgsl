@@ -62,5 +62,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   let oscillatingSource = vec4<f32>(0.0, 0.0, oscillationZ, 0.0);
 
-  textureStore(outTex, coord, field + params.dt * (source + oscillatingSource));
+  // source.w is a hard constraint mask for static charges.
+  let constrainedEz = select(field.z, source.z, source.w > 0.5);
+  let nextField = vec4<f32>(field.x, field.y, constrainedEz, field.w) + params.dt * oscillatingSource;
+
+  textureStore(outTex, coord, nextField);
 }

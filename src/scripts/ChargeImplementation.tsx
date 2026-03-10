@@ -125,18 +125,18 @@ const resumeSimulationLoop = () => {
   }
 };
 
-// Helper function to stamp a static point charge directly into the electric field.
-// This avoids unbounded energy growth from continuous source injection.
+// Helper function to stamp a static point charge into the persistent source field.
+// The source shader then enforces this as a fixed-field constraint each step.
 const injectStaticCharge = async (position: [number, number], charge: number) => {
   const gridSize = fdtdSimulation.getTextureSize();
   const pixelRadius = 2.0 / gridSize; // 2 pixels for better visibility
 
-  // Inject charge once with proper magnitude
+  // Store static Ez value in z and write a hard-constraint mask in w.
   const drawParams = new Float32Array([
     position[0], position[1], // position in [0,1] space
     pixelRadius, pixelRadius, // radius
-    0, 0, charge * STATIC_FIELD_STAMP, 0,
-    0, 0, 1, 1, // Replace mode: set value (don't accumulate)
+    0, 0, charge * STATIC_FIELD_STAMP, 1,
+    0, 0, 1, 0, // accumulate Ez, force mask to 1 in stamped area
   ]);
 
   const paramsBuffer = device.createBuffer({
@@ -145,9 +145,8 @@ const injectStaticCharge = async (position: [number, number], charge: number) =>
   });
   device.queue.writeBuffer(paramsBuffer, 0, drawParams);
 
-  // Stamp each ping-pong electric buffer independently.
-  // This prevents collapsing both buffers to one state when adding additional charges.
-  const targets: Array<'electricField' | 'electricFieldNext'> = ['electricField', 'electricFieldNext'];
+  // Stamp each ping-pong source buffer independently.
+  const targets: Array<'sourceField' | 'sourceFieldNext'> = ['sourceField', 'sourceFieldNext'];
   for (const targetName of targets) {
     const targetTexture = fdtdSimulation.getTexture(targetName);
     if (!targetTexture) continue;
@@ -235,7 +234,7 @@ const ChargeCanvas = () => {
           // setProbeY(y);
 
           if (sourceTypeRef.current === 'static') {
-            // Inject charge once immediately
+            // Add persistent static charge constraint
             injectStaticCharge([x, y], 1.0);
             staticCharges.push([x, y, 1.0]);
             console.log(`Added static charge at (${x}, ${y}), total charges: ${staticCharges.length}`);
@@ -351,6 +350,7 @@ const ChargeCanvas = () => {
   // Add center charge for testing
   const addCenterCharge = () => {
     staticCharges.length = 0; // Clear existing charges
+    fdtdSimulation.clearStaticSources();
     injectStaticCharge([0.5, 0.5], 1.0); // Inject once immediately
     staticCharges.push([0.5, 0.5, 1.0]);
     console.log('Added test charge at center (0.5, 0.5)');

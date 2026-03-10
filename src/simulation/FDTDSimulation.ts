@@ -174,6 +174,31 @@ export class FDTDSimulation {
     }
   }
 
+  public clearStaticSources() {
+    const zeroData = new Float32Array(this.textureSize * this.textureSize * 4);
+    const bytesPerRow = this.textureSize * 4 * 4;
+
+    const sourceCurrent = this.textures.get('sourceField');
+    if (sourceCurrent) {
+      this.device.queue.writeTexture(
+        { texture: sourceCurrent },
+        zeroData,
+        { bytesPerRow },
+        { width: this.textureSize, height: this.textureSize }
+      );
+    }
+
+    const sourceNext = this.textures.get('sourceFieldNext');
+    if (sourceNext) {
+      this.device.queue.writeTexture(
+        { texture: sourceNext },
+        zeroData,
+        { bytesPerRow },
+        { width: this.textureSize, height: this.textureSize }
+      );
+    }
+  }
+
   private initializeReusableResources() {
     // Create persistent temp texture for compute passes
     this.tempTexture = this.device.createTexture({
