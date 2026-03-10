@@ -39,7 +39,8 @@ const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
 const chargeGeometry = new THREE.SphereGeometry(0.2, 16, 16);
 const positiveChargeMaterial = new THREE.MeshStandardMaterial({ color: 0xff4444 });
 const negativeChargeMaterial = new THREE.MeshStandardMaterial({ color: 0x4444ff });
-
+const voltageOrbGeometry = new THREE.SphereGeometry(0.15, 16, 16);
+const voltageOrbMaterial = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
 
 // Add some default charges
 const charge1 = createDefaultCharge('charge-1');
@@ -82,8 +83,8 @@ const updateChargeMeshes = () => {
       charge.magnitude > 0 ? positiveChargeMaterial : negativeChargeMaterial;
     if (!mesh) {
       mesh = new THREE.Mesh(chargeGeometry, desiredMaterial);
-  mesh.userData = { chargeId: charge.id };
-  scene.add(mesh);
+      mesh.userData = { chargeId: charge.id };
+      scene.add(mesh);
       chargeMeshes.set(charge.id, mesh);
     } else {
       const isPositive = mesh.material === positiveChargeMaterial;
@@ -124,7 +125,7 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
   const seen: Set<string> = new Set();
   const upVector = new THREE.Vector3(0, 1, 0);
   const sphereRadius = 0.15;
-  const arrowScale = 2.0; 
+  const arrowScale = 2.0;
   const maxFieldMagnitude = 1e4;
 
   // Generate points around each voltage orb in a small grid
@@ -146,7 +147,7 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
 
     // Create or update arrows for this voltage point
     let arrows = voltagePointArrows.get(point.id);
-    
+
     // Calculate positions for arrows around the orb
     const arrowPositions: THREE.Vector3[] = [];
     for (let x = 0; x < gridSize; x++) {
@@ -154,14 +155,14 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
         for (let z = 0; z < gridSize; z++) {
           // Skip the center position (where the orb is)
           if (x === 1 && y === 1 && z === 1) continue;
-          
+
           const offset = new THREE.Vector3(
             gridOffset + x * gridStep,
             gridOffset + y * gridStep,
             gridOffset + z * gridStep
           );
           const arrowPos = point.position.clone().add(offset);
-          
+
           // Only add arrows that are at a reasonable distance from the orb
           const distance = offset.length();
           if (distance > sphereRadius && distance < sphereRadius + 0.6) {
@@ -186,7 +187,7 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       arrows = [];
       for (let i = 0; i < arrowPositions.length; i++) {
         const arrow = new THREE.Mesh(voltageArrowGeometry, voltageArrowMaterial);
-        arrow.scale.set(1, 1, 1); 
+        arrow.scale.set(1, 1, 1);
         scene.add(arrow);
         arrows.push(arrow);
       }
@@ -197,13 +198,13 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
     for (let i = 0; i < arrowPositions.length && i < arrows.length; i++) {
       const arrow = arrows[i];
       const arrowPos = arrowPositions[i];
-      
+
       // Calculate electric field at this position
       const fieldResult = electricFieldAt(arrowPos, charges);
       const field = fieldResult.field;
-      
+
       let arrowLength = field.length();
-      
+
       if (field.length() < 1e-6) {
         // Hide arrow if field is too small
         arrow.scale.set(0, 0, 0);
@@ -215,12 +216,12 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
 
       // Position arrow at the grid position (same as vector field)
       arrow.position.copy(arrowPos);
-      
+
       // Orient arrow in field direction
       const direction = field.clone().normalize();
       const quaternion = new THREE.Quaternion().setFromUnitVectors(upVector, direction);
       arrow.setRotationFromQuaternion(quaternion);
-      
+
       // Scale arrow (length along Y axis) - exactly like vector field
       arrow.scale.set(1, arrowLength, 1);
     }
@@ -275,7 +276,7 @@ const ThreeWorkspace: React.FC = () => {
   const [positionInputs, setPositionInputs] = useState({ x: '', y: '', z: '' });
   const selectedChargeIdRef = useRef<string | null>(null);
   const isEditingPositionRef = useRef(false);
-  
+
   useEffect(() => {
     if (!isEditingPositionRef.current && selectedCharge && selectedCharge.id !== selectedChargeIdRef.current) {
       selectedChargeIdRef.current = selectedCharge.id;
@@ -288,7 +289,7 @@ const ThreeWorkspace: React.FC = () => {
       selectedChargeIdRef.current = null;
     }
   }, [selectedCharge?.id]);
-  
+
   useEffect(() => {
     if (selectedCharge && !isEditingPositionRef.current) {
       const currentCharge = chargesState.find(c => c.id === selectedCharge.id);
@@ -509,10 +510,10 @@ const ThreeWorkspace: React.FC = () => {
     controls.enableDamping = true;
 
     if (!vectorFieldInitialized.current) {
-    const vectorFieldConfig = createDefaultVectorFieldConfig();
-    const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
-    vfRenderer.updateCharges(charges);
-    setVectorFieldRenderer(vfRenderer);
+      const vectorFieldConfig = createDefaultVectorFieldConfig();
+      const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
+      vfRenderer.updateCharges(charges);
+      setVectorFieldRenderer(vfRenderer);
       vectorFieldInitialized.current = true;
     }
 
@@ -609,18 +610,18 @@ const ThreeWorkspace: React.FC = () => {
         ref={containerRef}
         style={{ width: '100%', height: '100%', background: '#282c34' }}
       />
-      
+
       {/* Control panel - top left */}
       <div
         style={{
-        position: 'absolute',
-        top: '10px',
-        left: '10px',
+          position: 'absolute',
+          top: '10px',
+          left: '10px',
           background: 'rgba(0, 0, 0, 0.8)',
-        color: 'white',
+          color: 'white',
           padding: '15px',
           borderRadius: '8px',
-        fontFamily: 'monospace',
+          fontFamily: 'monospace',
           fontSize: '12px',
           minWidth: '260px',
         }}
@@ -708,11 +709,11 @@ const ThreeWorkspace: React.FC = () => {
         </div>
 
         <div style={{ marginBottom: '10px' }}>
-        <button 
-          onClick={toggleVectorField}
-          style={{
+          <button
+            onClick={toggleVectorField}
+            style={{
               padding: '8px 12px',
-            background: showVectorField ? '#4CAF50' : '#f44336',
+              background: showVectorField ? '#4CAF50' : '#f44336',
               color: 'white',
               border: 'none',
               borderRadius: '4px',
@@ -724,7 +725,7 @@ const ThreeWorkspace: React.FC = () => {
           >
             {showVectorField ? 'Hide' : 'Show'} Vector Field
           </button>
-          <button 
+          <button
             onClick={toggleFieldLines}
             style={{
               padding: '8px 12px',
