@@ -581,7 +581,7 @@ const ThreeWorkspace: React.FC = () => {
         fieldLineRenderer.dispose();
       }
     };
-  }, [handleMouseClick, vectorFieldRenderer, fieldLineRenderer, showFieldLines]);
+  }, [handleMouseClick, vectorFieldRenderer]);
 
   // Keep voltage point meshes in sync with state
   useEffect(() => {
