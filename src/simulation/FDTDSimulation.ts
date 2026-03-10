@@ -14,11 +14,13 @@ export class FDTDSimulation {
   private buffers: Map<string, GPUBuffer> = new Map();
   private sampler!: GPUSampler;
   private textureSize: number;
-  private dt: number = 0.001;
+  private readonly lightSpeed: number = 299_792_458;
+  private readonly courantFactor: number = 0.5;
+  private dt: number = 0;
   private cellSize: number = 0.01;
-  private courantFactor: number = 0.1;
   private time: number = 0;
   private alphaBetaDt: number = 0.001; // Track dt used for alpha-beta calculation
+  private alphaBetaCellSize: number = 0.01; // Track cellSize used for alpha-beta calculation
   private readbackBuffer: GPUBuffer | null = null;
   private stagingBuffer: GPUBuffer | null = null;
   private stagingBufferMapped: boolean = false; // Track if staging buffer is mapped
@@ -37,7 +39,9 @@ export class FDTDSimulation {
   constructor(device: GPUDevice, textureSize: number = 512) {
     this.device = device;
     this.textureSize = textureSize;
-    this.courantFactor = this.dt / this.cellSize;
+    this.dt = this.computeStableTimeStep(this.cellSize);
+    this.alphaBetaDt = this.dt;
+    this.alphaBetaCellSize = this.cellSize;
     this.initializeSampler();
   }
 
@@ -49,6 +53,14 @@ export class FDTDSimulation {
     return this.cellSize;
   }
 
+  public getTimeStep(): number {
+    return this.dt;
+  }
+
+  public getLightSpeed(): number {
+    return this.lightSpeed;
+  }
+
   public setCellSize(cellSize: number) {
     if (!Number.isFinite(cellSize) || cellSize <= 0) {
       throw new Error(`Invalid cell size: ${cellSize}`);
@@ -57,8 +69,13 @@ export class FDTDSimulation {
       return;
     }
     this.cellSize = cellSize;
-    this.dt = this.courantFactor * this.cellSize;
+    this.dt = this.computeStableTimeStep(cellSize);
     this.alphaBetaDt = Number.NaN;
+    this.alphaBetaCellSize = Number.NaN;
+  }
+
+  private computeStableTimeStep(cellSize: number): number {
+    return this.courantFactor * cellSize / this.lightSpeed;
   }
 
   private initializeSampler() {
@@ -118,6 +135,9 @@ export class FDTDSimulation {
     this.createTexture('sourceField', this.textureSize, this.textureSize);
     this.createTexture('sourceFieldNext', this.textureSize, this.textureSize); // Add double buffer for source field
 
+    // Initialize dynamic field/source textures to zero to avoid undefined startup values.
+    this.clearDynamicTextures();
+
     // Initialize material properties (vacuum by default)
     this.initializeMaterialField();
     this.initializeAlphaBeta();
@@ -127,6 +147,31 @@ export class FDTDSimulation {
 
     // Initialize reusable temp resources
     this.initializeReusableResources();
+  }
+
+  private clearDynamicTextures() {
+    const names = [
+      'electricField',
+      'electricFieldNext',
+      'magneticField',
+      'magneticFieldNext',
+      'sourceField',
+      'sourceFieldNext',
+    ];
+
+    const zeroData = new Float32Array(this.textureSize * this.textureSize * 4);
+    const bytesPerRow = this.textureSize * 4 * 4;
+
+    for (const name of names) {
+      const texture = this.textures.get(name);
+      if (!texture) continue;
+      this.device.queue.writeTexture(
+        { texture },
+        zeroData,
+        { bytesPerRow },
+        { width: this.textureSize, height: this.textureSize }
+      );
+    }
   }
 
   private initializeReusableResources() {
@@ -195,7 +240,7 @@ export class FDTDSimulation {
   }
 
   private initializeAlphaBeta() {
-    const simParams = new Float32Array([this.dt, this.cellSize, 0, 0]);
+    const simParams = new Float32Array([this.dt, this.cellSize, this.lightSpeed, 0]);
     const simBuffer = this.device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -330,11 +375,12 @@ export class FDTDSimulation {
   }
 
   private updateAlphaBetaFromMaterial(dt: number) {
-    // Only update if dt changed
-    if (this.alphaBetaDt !== dt) {
+    // Update when either dt or cell size changed
+    if (this.alphaBetaDt !== dt || this.alphaBetaCellSize !== this.cellSize) {
       this.alphaBetaDt = dt;
+      this.alphaBetaCellSize = this.cellSize;
 
-      const simParams = new Float32Array([dt, this.cellSize, 0, 0]);
+      const simParams = new Float32Array([dt, this.cellSize, this.lightSpeed, 0]);
       const simBuffer = this.device.createBuffer({
         size: 16,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,

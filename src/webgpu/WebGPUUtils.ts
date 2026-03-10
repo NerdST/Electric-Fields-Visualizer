@@ -59,6 +59,7 @@ export const setupFDTDRenderPipeline = async (gpuDevice: GPUDevice, textureSize:
   context.configure({
     device: gpuDevice,
     format,
+    alphaMode: 'opaque',
   });
 
   // Load render shaders
@@ -73,51 +74,8 @@ export const setupFDTDRenderPipeline = async (gpuDevice: GPUDevice, textureSize:
     label: 'field_fragment_shader'
   });
 
-  // Create explicit bind group layout to avoid auto-layout issues
-  const renderBindGroupLayout = gpuDevice.createBindGroupLayout({
-    entries: [
-      {
-        binding: 0,
-        visibility: GPUShaderStage.FRAGMENT,
-        texture: {
-          sampleType: 'unfilterable-float',
-          viewDimension: '2d',
-        },
-      },
-      {
-        binding: 1,
-        visibility: GPUShaderStage.FRAGMENT,
-        texture: {
-          sampleType: 'unfilterable-float',
-          viewDimension: '2d',
-        },
-      },
-      {
-        binding: 2,
-        visibility: GPUShaderStage.FRAGMENT,
-        texture: {
-          sampleType: 'float',
-          viewDimension: '2d',
-        },
-      },
-      {
-        binding: 3,
-        visibility: GPUShaderStage.FRAGMENT,
-        buffer: {
-          type: 'uniform',
-        },
-      },
-    ],
-    label: 'render_bind_group_layout',
-  });
-
-  const pipelineLayout = gpuDevice.createPipelineLayout({
-    bindGroupLayouts: [renderBindGroupLayout],
-    label: 'render_pipeline_layout',
-  });
-
   const renderPipeline = gpuDevice.createRenderPipeline({
-    layout: pipelineLayout,
+    layout: 'auto',
     vertex: {
       module: vertexModule,
       entryPoint: 'vs_main',
@@ -139,7 +97,7 @@ export const setupFDTDRenderPipeline = async (gpuDevice: GPUDevice, textureSize:
     label: 'render_config_buffer',
   });
 
-  return { context, renderPipeline, renderBindGroupLayout, renderConfigBuffer };
+  return { context, renderPipeline, renderConfigBuffer };
 };
 
 // Update FDTD render function
@@ -148,7 +106,6 @@ export const updateFDTDRender = (
   simulation: FDTDSimulation,
   device: GPUDevice,
   renderPipeline: GPURenderPipeline,
-  renderBindGroupLayout: GPUBindGroupLayout,
   renderConfigBuffer: GPUBuffer
 ) => {
   // Get all required textures
@@ -163,19 +120,19 @@ export const updateFDTDRender = (
 
   // Config values: brightness, electricEnergyFactor, magneticEnergyFactor, time
   // Keep brightness independent from cell spacing to avoid saturation when UI spacing changes.
-  const brightness = 0.1;
+  const brightness = 1.0;
 
   const configData = new Float32Array([
     brightness, // brightness calculated from cellSize
-    0.5,  // electricEnergyFactor
-    0.5,  // magneticEnergyFactor
+    1.0,  // electricEnergyFactor
+    1.0,  // magneticEnergyFactor
     simulation.getTime(), // time
   ]);
 
   device.queue.writeBuffer(renderConfigBuffer, 0, configData);
 
   const bindGroup = device.createBindGroup({
-    layout: renderBindGroupLayout,
+    layout: renderPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: electricFieldTexture.createView() },
       { binding: 1, resource: magneticFieldTexture.createView() },

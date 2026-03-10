@@ -6,7 +6,8 @@
 @fragment
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let dims = textureDimensions(electricFieldTexture);
-  let coord = vec2<i32>(uv * vec2<f32>(dims));
+  let maxCoord = vec2<f32>(dims) - vec2<f32>(1.0, 1.0);
+  let coord = vec2<i32>(clamp(uv * vec2<f32>(dims), vec2<f32>(0.0, 0.0), maxCoord));
   
   // Sample field values
   let electricField = textureLoad(electricFieldTexture, coord, 0).xyz;
@@ -14,7 +15,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let material = textureLoad(materialTexture, coord, 0).xyz;
   
   // Extract config values
-  let brightness = config.x * 10.0; // Moderate multiplier for good visibility
+  let brightness = max(config.x, 1e-6);
   let electricEnergyFactor = config.y;
   let magneticEnergyFactor = config.z;
   
@@ -22,42 +23,24 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
   let permeability = material.x;
   let permittivity = material.y;
   
-  // Calculate field magnitudes (Ez is primary component in 2D TM mode)
+  // Ez is primary electric component in 2D TM mode.
   let Ez = electricField.z;
   let Hz_magnitude = length(magneticField.xy);
-  
-  // Energy densities: U_E = 0.5 * ε * E², U_H = 0.5 * μ * H²
-  let electricEnergy = electricEnergyFactor * permittivity * Ez * Ez;
-  let magneticEnergy = magneticEnergyFactor * permeability * Hz_magnitude * Hz_magnitude;
-  
-  // Apply brightness scaling with better dynamic range
-  let scaledElectricEnergy = brightness * electricEnergy;
-  let scaledMagneticEnergy = brightness * magneticEnergy;
-  
-  // Apply gamma correction for better visibility of low values
-  let gamma = 0.5;
-  let electricVis = pow(clamp(scaledElectricEnergy, 0.0, 1.0), gamma);
-  let magneticVis = pow(clamp(scaledMagneticEnergy, 0.0, 1.0), gamma);
-  
-  // Enhanced bloom effect for bright regions
-  let bloomThreshold = 0.05;
-  let bloomStrength = 0.5;
-  let totalEnergy = electricVis + magneticVis;
-  let bloom = max(0.0, totalEnergy - bloomThreshold) * bloomStrength;
-  
-  // Color mapping with better contrast:
-  // Red = Electric field energy (Ez)
-  // Blue = Magnetic field energy (Hx, Hy)
-  // White/Yellow = High energy regions (bloom)
-  let finalElectric = clamp(electricVis + bloom * 0.5, 0.0, 1.0);
-  let finalMagnetic = clamp(magneticVis + bloom * 0.5, 0.0, 1.0);
-  let finalBloom = clamp(bloom, 0.0, 1.0);
-  
-  let color = vec3<f32>(
-    finalElectric,                    // Red: electric field
-    finalBloom,                       // Green: bloom/mixed energy
-    finalMagnetic                     // Blue: magnetic field
-  );
+  let eGain = 12.0 * brightness * electricEnergyFactor * max(permittivity, 1e-6);
+  let hGain = 10.0 * brightness * magneticEnergyFactor * max(permeability, 1e-6);
+
+  let eMag = abs(Ez);
+  let eVis = 1.0 - exp(-eMag * eGain);
+  let hVis = 1.0 - exp(-Hz_magnitude * hGain);
+
+  let positiveColor = vec3<f32>(1.0, 0.28, 0.05);
+  let negativeColor = vec3<f32>(0.10, 0.45, 1.0);
+  let magneticColor = vec3<f32>(0.10, 0.95, 0.85);
+
+  let electricColor = select(negativeColor, positiveColor, Ez >= 0.0);
+  var color = electricColor * eVis + magneticColor * (0.45 * hVis);
+  color = max(color, vec3<f32>(0.02, 0.02, 0.02));
+  color = clamp(color, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));
   
   return vec4<f32>(color, 1.0);
 }

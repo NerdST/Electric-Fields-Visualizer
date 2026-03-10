@@ -9,7 +9,6 @@ let fdtdSimulation: FDTDSimulation;
 let renderContext: GPUCanvasContext;
 let renderPipeline: GPURenderPipeline;
 let renderConfigBuffer: GPUBuffer;
-let renderBindGroupLayout: GPUBindGroupLayout;
 
 // Simulation state
 let simulationSpeed = 1024; // Steps per second
@@ -18,11 +17,21 @@ let simulationStepCount = 0; // Track total simulation steps
 // Store all static point charges as [x, y, charge] tuples
 const staticCharges: Array<[number, number, number]> = [];
 const CELL_SIZE_OPTIONS_NM = [1, 2, 5, 10, 20, 50, 100];
+const STATIC_FIELD_STAMP = 1.0;
+const OSCILLATING_FIELD_STAMP = 0.1;
 
-// NOTE: The FDTD solver is currently non-dimensional.
-// We map UI "nm" values to stable simulation cell units instead of literal meters.
-// 5 nm maps to the previous default cellSize (0.01).
-const nmToSimulationCellSize = (valueNm: number) => valueNm * 0.002;
+const nmToMeters = (valueNm: number) => valueNm * 1e-9;
+
+const formatSimTime = (seconds: number) => {
+  const absSeconds = Math.abs(seconds);
+  if (absSeconds >= 1) return `${seconds.toFixed(6)} s`;
+  if (absSeconds >= 1e-3) return `${(seconds * 1e3).toFixed(6)} ms`;
+  if (absSeconds >= 1e-6) return `${(seconds * 1e6).toFixed(6)} µs`;
+  if (absSeconds >= 1e-9) return `${(seconds * 1e9).toFixed(6)} ns`;
+  if (absSeconds >= 1e-12) return `${(seconds * 1e12).toFixed(6)} ps`;
+  if (absSeconds >= 1e-15) return `${(seconds * 1e15).toFixed(6)} fs`;
+  return `${seconds.toExponential(3)} s`;
+};
 
 const applyCanvasZoom = (zoomLevel: number, textureSize: number) => {
   const canvas = document.getElementById('fdtd-canvas') as HTMLCanvasElement | null;
@@ -49,7 +58,6 @@ const initialize = async (initialCellSize: number, initialZoom: number) => {
     const renderSetup = await setupFDTDRenderPipeline(device, fdtdSim.getTextureSize());
     renderContext = renderSetup.context;
     renderPipeline = renderSetup.renderPipeline;
-    renderBindGroupLayout = renderSetup.renderBindGroupLayout;
     renderConfigBuffer = renderSetup.renderConfigBuffer;
     applyCanvasZoom(initialZoom, fdtdSim.getTextureSize());
 
@@ -88,7 +96,7 @@ const startSimulationLoop = () => {
         // Update counter display
         const counterElement = document.getElementById('step-counter');
         if (counterElement) {
-          counterElement.textContent = `Step: ${simulationStepCount}`;
+          counterElement.textContent = `Step: ${simulationStepCount} | t: ${formatSimTime(fdtdSimulation.getTime())}`;
         }
       }
     } catch (error) {
@@ -115,7 +123,8 @@ const resumeSimulationLoop = () => {
   }
 };
 
-// Helper function to inject a static point charge into the source field
+// Helper function to stamp a static point charge directly into the electric field.
+// This avoids unbounded energy growth from continuous source injection.
 const injectStaticCharge = async (position: [number, number], charge: number) => {
   const gridSize = fdtdSimulation.getTextureSize();
   const pixelRadius = 2.0 / gridSize; // 2 pixels for better visibility
@@ -124,7 +133,7 @@ const injectStaticCharge = async (position: [number, number], charge: number) =>
   const drawParams = new Float32Array([
     position[0], position[1], // position in [0,1] space
     pixelRadius, pixelRadius, // radius
-    0, 0, charge * 1.0, 0, // z-component value (higher since injected once)
+    0, 0, charge * STATIC_FIELD_STAMP, 0,
     0, 0, 1, 1, // Replace mode: set value (don't accumulate)
   ]);
 
@@ -143,7 +152,7 @@ const injectStaticCharge = async (position: [number, number], charge: number) =>
   const bindGroup = device.createBindGroup({
     layout: fdtdSimulation.getPipeline('drawEllipse')!.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: fdtdSimulation.getTexture('sourceField')!.createView() },
+      { binding: 0, resource: fdtdSimulation.getTexture('electricField')!.createView() },
       { binding: 1, resource: { buffer: paramsBuffer } },
       { binding: 2, resource: tempTexture.createView() },
     ],
@@ -151,18 +160,18 @@ const injectStaticCharge = async (position: [number, number], charge: number) =>
 
   fdtdSimulation.runComputePass('drawEllipse', bindGroup, Math.ceil(gridSize / 8), Math.ceil(gridSize / 8));
 
-  // Copy result back into both current and next source textures (double buffer)
+  // Copy result back into both electric buffers (double buffer)
   const commandEncoder = device.createCommandEncoder();
   commandEncoder.copyTextureToTexture(
     { texture: tempTexture },
-    { texture: fdtdSimulation.getTexture('sourceField')! },
+    { texture: fdtdSimulation.getTexture('electricField')! },
     [gridSize, gridSize]
   );
-  const nextSourceTex = fdtdSimulation.getTexture('sourceFieldNext');
-  if (nextSourceTex) {
+  const nextElectricTex = fdtdSimulation.getTexture('electricFieldNext');
+  if (nextElectricTex) {
     commandEncoder.copyTextureToTexture(
       { texture: tempTexture },
-      { texture: nextSourceTex },
+      { texture: nextElectricTex },
       [gridSize, gridSize]
     );
   }
@@ -179,11 +188,12 @@ const startRenderLoop = () => {
   const render = () => {
     try {
       if (fdtdSimulation && renderContext && device) {
-        updateFDTDRender(renderContext, fdtdSimulation, device, renderPipeline, renderBindGroupLayout, renderConfigBuffer);
+        updateFDTDRender(renderContext, fdtdSimulation, device, renderPipeline, renderConfigBuffer);
       }
-      requestAnimationFrame(render);
     } catch (error) {
       console.error('Render loop error:', error);
+    } finally {
+      requestAnimationFrame(render);
     }
   };
 
@@ -202,7 +212,7 @@ const ChargeCanvas = () => {
 
   // Initialize simulation once on mount
   React.useEffect(() => {
-    initialize(nmToSimulationCellSize(cellSizeNm), zoomLevel);
+    initialize(nmToMeters(cellSizeNm), zoomLevel);
 
     // Add mouse handler to place static point charges on click
     const handleMouseClick = (event: MouseEvent) => {
@@ -224,7 +234,7 @@ const ChargeCanvas = () => {
             const oscillatingSource: OscillatingSource = {
               position: [x, y],
               radius: pixelRadius,
-              amplitude: 2.0,
+              amplitude: OSCILLATING_FIELD_STAMP / Math.max(fdtdSimulation.getTimeStep(), 1e-30),
               frequency: 5.0,
               phase: 0.0,
             };
@@ -259,7 +269,7 @@ const ChargeCanvas = () => {
 
   React.useEffect(() => {
     if (fdtdSimulation) {
-      fdtdSimulation.setCellSize(nmToSimulationCellSize(cellSizeNm));
+      fdtdSimulation.setCellSize(nmToMeters(cellSizeNm));
     }
   }, [cellSizeNm]);
 
@@ -424,9 +434,6 @@ const ChargeCanvas = () => {
               <option key={option} value={option}>{option} nm</option>
             ))}
           </select>
-          <span style={{ fontSize: '10px', color: '#777' }} title="Relative simulation spacing scale">
-            (scale)
-          </span>
         </div>
         <div style={{
           display: 'flex',
@@ -476,6 +483,12 @@ const ChargeCanvas = () => {
         border: '1px solid #ccc',
         minWidth: '200px'
       }}>
+        <div style={{ marginBottom: '8px' }}>
+          <strong>Physical Mode</strong>
+          <div style={{ fontSize: '10px', color: '#888', marginTop: '2px' }}>
+            Δx: {cellSizeNm} nm | Δt: {fdtdSimulation ? formatSimTime(fdtdSimulation.getTimeStep()) : '...'}
+          </div>
+        </div>
         <div><strong>Probe Position (0 to 1):</strong></div>
         <div style={{ marginTop: '5px' }}>
           <label>X: </label>
