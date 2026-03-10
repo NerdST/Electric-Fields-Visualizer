@@ -21,6 +21,21 @@ const STATIC_FIELD_STAMP = 1.0;
 const OSCILLATING_FIELD_STAMP = 0.1;
 const OSCILLATING_PHASE_STEP_RAD = 0.2;
 const TWO_PI = Math.PI * 2;
+const PROBE_SAMPLE_INTERVAL_MS = 100;
+const PROBE_HISTORY_WINDOW_MS = 5_000;
+
+type ProbeFieldValue = {
+  Ex: number;
+  Ey: number;
+  Ez: number;
+  magnitude: number;
+};
+
+type ProbeHistorySample = {
+  wallTimeMs: number;
+  simulationTime: number;
+  magnitude: number;
+};
 
 const nmToMeters = (valueNm: number) => valueNm * 1e-9;
 
@@ -43,6 +58,112 @@ const applyCanvasZoom = (zoomLevel: number, textureSize: number) => {
   const canvasPixels = Math.round(textureSize * clampedZoom);
   canvas.style.width = `${canvasPixels}px`;
   canvas.style.height = `${canvasPixels}px`;
+};
+
+const appendProbeSample = (
+  history: ProbeHistorySample[],
+  nextSample: ProbeHistorySample
+) => {
+  const lastSample = history[history.length - 1];
+  if (lastSample && nextSample.simulationTime <= lastSample.simulationTime) {
+    return history;
+  }
+
+  const cutoffWallTime = nextSample.wallTimeMs - PROBE_HISTORY_WINDOW_MS;
+  return [...history, nextSample].filter((sample) => sample.wallTimeMs >= cutoffWallTime);
+};
+
+const ProbeWaveform = ({ history, currentValue }: { history: ProbeHistorySample[]; currentValue: ProbeFieldValue | null }) => {
+  const width = 250;
+  const height = 110;
+  const padding = 12;
+  const chartWidth = width - padding * 2;
+  const chartHeight = height - padding * 2;
+
+  if (history.length < 2 || !currentValue) {
+    return (
+      <div style={{ marginTop: '12px', borderTop: '1px solid #ddd', paddingTop: '10px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+          <strong>Probe Wave</strong>
+          <span style={{ fontSize: '10px', color: '#888' }}>|E| over simulation time</span>
+        </div>
+        <div style={{
+          marginTop: '8px',
+          width: `${width}px`,
+          height: `${height}px`,
+          borderRadius: '4px',
+          border: '1px solid #d6dde5',
+          backgroundColor: 'rgba(247, 250, 252, 0.95)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: '#8a94a6',
+          fontSize: '11px'
+        }}>
+          Waiting for probe samples...
+        </div>
+      </div>
+    );
+  }
+
+  let minMagnitude = Number.POSITIVE_INFINITY;
+  let maxMagnitude = Number.NEGATIVE_INFINITY;
+  for (const sample of history) {
+    if (sample.magnitude < minMagnitude) minMagnitude = sample.magnitude;
+    if (sample.magnitude > maxMagnitude) maxMagnitude = sample.magnitude;
+  }
+
+  const yRange = Math.max(maxMagnitude - minMagnitude, 1e-12);
+  const startWallTime = history[0].wallTimeMs;
+  const endWallTime = history[history.length - 1].wallTimeMs;
+  const wallTimeRangeSeconds = Math.max((endWallTime - startWallTime) / 1000, 1e-6);
+  const startSimulationTime = history[0].simulationTime;
+  const endSimulationTime = history[history.length - 1].simulationTime;
+  const simulationTimeRange = Math.max(endSimulationTime - startSimulationTime, 1e-18);
+
+  const pathData = history.map((sample, index) => {
+    const normalizedX = (sample.wallTimeMs - startWallTime) / (wallTimeRangeSeconds * 1000);
+    const normalizedY = (sample.magnitude - minMagnitude) / yRange;
+    const x = padding + normalizedX * chartWidth;
+    const y = padding + (1 - normalizedY) * chartHeight;
+    return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
+  }).join(' ');
+
+  const simulationSpanLabel = formatSimTime(simulationTimeRange);
+  const realTimeSpanLabel = `${wallTimeRangeSeconds.toFixed(1)} s`;
+
+  return (
+    <div style={{ marginTop: '12px', borderTop: '1px solid #ddd', paddingTop: '10px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <strong>Probe Wave</strong>
+        <span style={{ fontSize: '10px', color: '#888' }}>{history.length} samples</span>
+      </div>
+      <div style={{ marginTop: '4px', fontSize: '10px', color: '#667085' }}>
+        |E| now: {currentValue.magnitude.toExponential(3)} | IRL: {realTimeSpanLabel} | sim: {simulationSpanLabel}
+      </div>
+      <svg
+        width={width}
+        height={height}
+        viewBox={`0 0 ${width} ${height}`}
+        style={{
+          marginTop: '8px',
+          borderRadius: '4px',
+          border: '1px solid #d6dde5',
+          backgroundColor: 'rgba(247, 250, 252, 0.95)',
+          display: 'block'
+        }}
+      >
+        <line x1={padding} y1={padding} x2={padding} y2={height - padding} stroke="#c7d0db" strokeWidth="1" />
+        <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="#c7d0db" strokeWidth="1" />
+        <line x1={padding} y1={padding + chartHeight / 2} x2={width - padding} y2={padding + chartHeight / 2} stroke="#e3e8ef" strokeWidth="1" strokeDasharray="3 3" />
+        <path d={pathData} fill="none" stroke="#1e88e5" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+        <text x={padding} y={padding - 2} fontSize="9" fill="#667085">{maxMagnitude.toExponential(2)}</text>
+        <text x={padding} y={height - 2} fontSize="9" fill="#667085">{minMagnitude.toExponential(2)}</text>
+        <text x={padding} y={height - padding + 10} fontSize="9" fill="#667085">now - 5s</text>
+        <text x={width - padding} y={height - padding + 10} fontSize="9" fill="#667085" textAnchor="end">now</text>
+      </svg>
+    </div>
+  );
 };
 
 // Updated initialization - Fixed device scope and error handling
@@ -204,7 +325,8 @@ const ChargeCanvas = () => {
   // Probe position in normalized [0, 1] space (matches texture coordinates)
   const [probeX, setProbeX] = React.useState(0.5);
   const [probeY, setProbeY] = React.useState(0.5);
-  const [fieldValue, setFieldValue] = React.useState<{ Ex: number, Ey: number, Ez: number, magnitude: number } | null>(null);
+  const [fieldValue, setFieldValue] = React.useState<ProbeFieldValue | null>(null);
+  const [probeHistory, setProbeHistory] = React.useState<ProbeHistorySample[]>([]);
   const [sourceType, setSourceType] = React.useState<'static' | 'oscillating'>('static');
   const [oscFrequencyInput, setOscFrequencyInput] = React.useState('1e15');
   const [cellSizeNm, setCellSizeNm] = React.useState(5);
@@ -294,32 +416,54 @@ const ChargeCanvas = () => {
     applyCanvasZoom(zoomLevel, textureSize);
   }, [zoomLevel]);
 
+  React.useEffect(() => {
+    setProbeHistory([]);
+  }, [probeX, probeY, cellSizeNm]);
+
   // Separate effect for reading probe values when position changes
   React.useEffect(() => {
+    let isActive = true;
+
     const readProbeValue = async () => {
       if (fdtdSimulation) {
         try {
           // Coordinates are already in [0,1] space - pass directly
           const data = await fdtdSimulation.readFieldValueAt(probeX, probeY);
-          setFieldValue({
+          if (!isActive) {
+            return;
+          }
+
+          const nextFieldValue: ProbeFieldValue = {
             Ex: data[0],
             Ey: data[1],
             Ez: data[2],
             magnitude: data[3]
-          });
+          };
+          const wallTimeMs = performance.now();
+          const simulationTime = fdtdSimulation.getTime();
+
+          setFieldValue(nextFieldValue);
+          setProbeHistory((history) => appendProbeSample(history, {
+            wallTimeMs,
+            simulationTime,
+            magnitude: nextFieldValue.magnitude,
+          }));
         } catch (error) {
           console.error('Error reading field value:', error);
         }
       }
     };
 
+    readProbeValue();
+
     // Read probe value every 100ms
-    const probeTimer = setInterval(readProbeValue, 100);
+    const probeTimer = setInterval(readProbeValue, PROBE_SAMPLE_INTERVAL_MS);
 
     return () => {
+      isActive = false;
       clearInterval(probeTimer);
     };
-  }, [probeX, probeY]);
+  }, [probeX, probeY, cellSizeNm]);
 
   // Test runner function
   const runTests = async () => {
@@ -583,6 +727,7 @@ const ChargeCanvas = () => {
         ) : (
           <div>Reading...</div>
         )}
+        <ProbeWaveform history={probeHistory} currentValue={fieldValue} />
         <div style={{ marginTop: '12px', borderTop: '1px solid #ddd', paddingTop: '10px' }}>
           <button
             onClick={addCenterCharge}
