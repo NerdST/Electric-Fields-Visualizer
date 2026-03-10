@@ -19,6 +19,8 @@ const staticCharges: Array<[number, number, number]> = [];
 const CELL_SIZE_OPTIONS_NM = [1, 2, 5, 10, 20, 50, 100];
 const STATIC_FIELD_STAMP = 1.0;
 const OSCILLATING_FIELD_STAMP = 0.1;
+const OSCILLATING_PHASE_STEP_RAD = 0.2;
+const TWO_PI = Math.PI * 2;
 
 const nmToMeters = (valueNm: number) => valueNm * 1e-9;
 
@@ -205,9 +207,15 @@ const ChargeCanvas = () => {
   const [probeY, setProbeY] = React.useState(0.5);
   const [fieldValue, setFieldValue] = React.useState<{ Ex: number, Ey: number, Ez: number, magnitude: number } | null>(null);
   const [sourceType, setSourceType] = React.useState<'static' | 'oscillating'>('static');
+  const [oscFrequencyInput, setOscFrequencyInput] = React.useState('1e15');
   const [cellSizeNm, setCellSizeNm] = React.useState(5);
   const [zoomLevel, setZoomLevel] = React.useState(4);
   const sourceTypeRef = React.useRef<'static' | 'oscillating'>('static');
+  const oscFrequencyRef = React.useRef('1e15');
+
+  React.useEffect(() => {
+    oscFrequencyRef.current = oscFrequencyInput;
+  }, [oscFrequencyInput]);
 
   // Initialize simulation once on mount
   React.useEffect(() => {
@@ -222,6 +230,10 @@ const ChargeCanvas = () => {
           const x = (event.clientX - rect.left) / rect.width; // [0, 1]
           const y = 1 - ((event.clientY - rect.top) / rect.height); // [0, 1] with y-flip
 
+          // Move the probe to the latest source placement so field readback is immediate.
+          // setProbeX(x);
+          // setProbeY(y);
+
           if (sourceTypeRef.current === 'static') {
             // Inject charge once immediately
             injectStaticCharge([x, y], 1.0);
@@ -230,15 +242,21 @@ const ChargeCanvas = () => {
           } else {
             const gridSize = fdtdSimulation.getTextureSize();
             const pixelRadius = 2.0 / gridSize;
+            const dt = Math.max(fdtdSimulation.getTimeStep(), 1e-30);
+            const fallbackFrequencyHz = OSCILLATING_PHASE_STEP_RAD / (TWO_PI * dt);
+            const parsedFrequency = Number(oscFrequencyRef.current);
+            const oscillatorFrequencyHz = Number.isFinite(parsedFrequency) && parsedFrequency > 0
+              ? parsedFrequency
+              : fallbackFrequencyHz;
             const oscillatingSource: OscillatingSource = {
               position: [x, y],
               radius: pixelRadius,
-              amplitude: OSCILLATING_FIELD_STAMP / Math.max(fdtdSimulation.getTimeStep(), 1e-30),
-              frequency: 5.0,
+              amplitude: OSCILLATING_FIELD_STAMP / dt,
+              frequency: oscillatorFrequencyHz,
               phase: 0.0,
             };
             fdtdSimulation.addOscillatingSource(oscillatingSource);
-            console.log(`Added oscillating source at (${x}, ${y})`);
+            console.log(`Added oscillating source at (${x}, ${y}) with f=${oscillatorFrequencyHz} Hz`);
           }
         }
       }
@@ -405,6 +423,35 @@ const ChargeCanvas = () => {
             <option value="static">Static</option>
             <option value="oscillating">Oscillating</option>
           </select>
+        </div>
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          fontFamily: 'monospace',
+          fontSize: '12px',
+          color: '#333',
+          backgroundColor: 'rgba(255, 255, 255, 0.9)',
+          padding: '6px 8px',
+          borderRadius: '4px',
+          border: '1px solid #ccc'
+        }}>
+          <label htmlFor="osc-frequency">f (Hz):</label>
+          <input
+            id="osc-frequency"
+            type="text"
+            inputMode="decimal"
+            value={oscFrequencyInput}
+            onChange={(event) => setOscFrequencyInput(event.target.value)}
+            disabled={sourceType !== 'oscillating'}
+            style={{
+              width: '90px',
+              fontFamily: 'monospace',
+              fontSize: '12px',
+              padding: '2px 4px'
+            }}
+            title="Oscillating source frequency in Hz. Scientific notation is supported (e.g. 1e3)."
+          />
         </div>
         <div style={{
           display: 'flex',
