@@ -1,9 +1,9 @@
- import ThreeWorkspace from './scripts/ThreeWorkspace';
+//  import ThreeWorkspace from './scripts/ThreeWorkspace';
 
-const ThreeCanvas = () => {
-  return (
-    <ThreeWorkspace />
-  );
-}
+// const ThreeCanvas = () => {
+//   return (
+//     <ThreeWorkspace />
+//   );
+// }
 
-export default ThreeCanvas
+// export default ThreeCanvas
