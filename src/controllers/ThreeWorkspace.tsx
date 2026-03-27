@@ -308,6 +308,17 @@ const ThreeWorkspace: React.FC = () => {
     z: 0,
   });
 
+  // Pin probe: recalculate voltage at all measurement points when charges change
+  useEffect(() => {
+    if (voltagePoints.length === 0) return;
+    const updated = voltagePoints.map((point) => {
+      const fieldResult = electricFieldAt(point.position, chargesState);
+      return { ...point, voltage: fieldResult.potential };
+    });
+    setVoltagePoints(updated);
+    updateVoltagePointMeshes(updated);
+  }, [chargesState]);
+
   // Hover voltage readout
   const [hoverVoltage, setHoverVoltage] = useState<number | null>(null);
   const [hoverPosition, setHoverPosition] = useState<THREE.Vector3 | null>(null);
