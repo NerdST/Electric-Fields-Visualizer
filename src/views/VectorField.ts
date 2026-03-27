@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { electricFieldAt } from '../models/Charge';
-import type { Charge } from '../models/Charge';
+import type { Charge, ElectricFieldResult } from '../models/Charge';
+
+export type FieldSampler = (position: THREE.Vector3, charges: Charge[]) => ElectricFieldResult;
 
 export interface VectorFieldConfig {
   gridSize: number;
@@ -8,6 +10,7 @@ export interface VectorFieldConfig {
   arrowScale: number;
   maxFieldMagnitude: number;
   showDirectionOnly: boolean;
+  fieldSampler?: FieldSampler;
 }
 
 export class VectorFieldRenderer {
@@ -16,6 +19,7 @@ export class VectorFieldRenderer {
   private arrowGeometry: THREE.ConeGeometry;
   private arrowMaterial: THREE.MeshBasicMaterial;
   private config: VectorFieldConfig;
+  private readonly fieldSampler: FieldSampler;
   private charges: Charge[] = [];
   private gridPoints: THREE.Vector3[] = [];
   private readonly upVector: THREE.Vector3 = new THREE.Vector3(0, 1, 0);
@@ -23,14 +27,15 @@ export class VectorFieldRenderer {
   constructor(scene: THREE.Scene, config: VectorFieldConfig) {
     this.scene = scene;
     this.config = config;
-    
+    this.fieldSampler = config.fieldSampler ?? electricFieldAt;
+
     this.arrowGeometry = new THREE.ConeGeometry(0.05, 0.2, 8);
-    this.arrowMaterial = new THREE.MeshBasicMaterial({ 
+    this.arrowMaterial = new THREE.MeshBasicMaterial({
       color: 0x00ff00,
       transparent: true,
       opacity: 0.8
     });
-    
+
     this.createVectorField();
   }
 
@@ -42,7 +47,7 @@ export class VectorFieldRenderer {
 
     this.gridPoints = this.generateGridPoints();
     const instanceCount = this.gridPoints.length;
-    
+
     if (instanceCount === 0) return;
 
     this.arrowMesh = new THREE.InstancedMesh(
@@ -59,7 +64,7 @@ export class VectorFieldRenderer {
     const points: THREE.Vector3[] = [];
     const { min, max } = this.config.bounds;
     const step = (max.x - min.x) / this.config.gridSize;
-    
+
     for (let x = 0; x < this.config.gridSize; x++) {
       for (let y = 0; y < this.config.gridSize; y++) {
         for (let z = 0; z < this.config.gridSize; z++) {
@@ -72,7 +77,7 @@ export class VectorFieldRenderer {
         }
       }
     }
-    
+
     return points;
   }
 
@@ -86,7 +91,7 @@ export class VectorFieldRenderer {
 
     for (let i = 0; i < gridPoints.length; i++) {
       const point = gridPoints[i];
-      const fieldResult = electricFieldAt(point, this.charges);
+      const fieldResult = this.fieldSampler(point, this.charges);
       const field = fieldResult.field;
 
       if (field.length() < 1e-6) {
@@ -97,7 +102,7 @@ export class VectorFieldRenderer {
 
       let arrowLength = field.length();
       if (this.config.showDirectionOnly) {
-        arrowLength = 0.3; 
+        arrowLength = 0.3;
       } else {
         // CHANGE: Scale field magnitude more reasonably
         const normalizedMagnitude = Math.min(arrowLength / this.config.maxFieldMagnitude, 1);
@@ -105,9 +110,9 @@ export class VectorFieldRenderer {
       }
 
       position.copy(point);
-      
+
       scale.set(1, arrowLength, 1);
-      
+
       const direction = field.clone().normalize();
       quaternion.setFromUnitVectors(this.upVector, direction);
 
@@ -121,12 +126,12 @@ export class VectorFieldRenderer {
   public updateCharges(charges: Charge[]) {
     this.charges = charges;
     if (!this.arrowMesh) return;
-    
+
     const wasVisible = this.arrowMesh.visible;
     const wasInScene = this.scene.children.includes(this.arrowMesh);
-    
+
     this.updateVectorField();
-    
+
     if (this.arrowMesh) {
       this.arrowMesh.visible = wasVisible;
       if (!wasInScene && wasVisible) {
@@ -140,7 +145,7 @@ export class VectorFieldRenderer {
     const oldGridPoints = this.gridPoints;
     const oldCount = oldGridPoints.length;
     this.config = nextConfig;
-  
+
     this.gridPoints = this.generateGridPoints();
     const newCount = this.gridPoints.length;
     if (newCount !== oldCount || !this.arrowMesh) {
@@ -179,6 +184,6 @@ export function createDefaultVectorFieldConfig(): VectorFieldConfig {
     },
     arrowScale: 2.0,
     maxFieldMagnitude: 1e4,
-    showDirectionOnly: false
+    showDirectionOnly: false,
   };
 }

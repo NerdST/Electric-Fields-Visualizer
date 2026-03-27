@@ -1,0 +1,844 @@
+// Enhanced FDTD Simulation class
+export type OscillatingSource = {
+  position: [number, number];
+  radius: number;
+  amplitude: number;
+  frequency: number;
+  phase: number;
+};
+
+export type GridDimensions = {
+  nx: number;
+  ny: number;
+  nz: number;
+};
+
+export class FDTDSimulation {
+  private device: GPUDevice;
+  private pipelines: Map<string, GPUComputePipeline> = new Map();
+  private textures: Map<string, GPUTexture> = new Map();
+  private buffers: Map<string, GPUBuffer> = new Map();
+  private sampler!: GPUSampler;
+  private textureSize: number;
+  private gridDimensions: GridDimensions;
+  private readonly lightSpeed: number = 299_792_458;
+  private readonly courantFactor: number = 0.5;
+  private dt: number = 0;
+  private cellSize: number = 0.01;
+  private time: number = 0;
+  private alphaBetaDt: number = 0.001; // Track dt used for alpha-beta calculation
+  private alphaBetaCellSize: number = 0.01; // Track cellSize used for alpha-beta calculation
+  private readbackBuffer: GPUBuffer | null = null;
+  private stagingBuffer: GPUBuffer | null = null;
+  private stagingBufferMapped: boolean = false; // Track if staging buffer is mapped
+  private readbackInProgress: boolean = false; // Prevent concurrent readback calls
+  private readbackQueue: Array<{ x: number; y: number; resolve: (data: Float32Array) => void; reject: (err: any) => void }> = [];
+
+  // Reusable resources to avoid allocation churn
+  private tempTexture: GPUTexture | null = null;
+  private injectParamsBuffer: GPUBuffer | null = null;
+  private decayParamsBuffer: GPUBuffer | null = null;
+  private oscillatorBuffer: GPUBuffer | null = null;
+  private oscillatingSources: OscillatingSource[] = [];
+  private oscillatorBufferDirty: boolean = false;
+  private maxOscillators: number = 64;
+
+  constructor(device: GPUDevice, textureSize: number | GridDimensions = 512) {
+    this.device = device;
+    if (typeof textureSize === 'number') {
+      this.textureSize = textureSize;
+      this.gridDimensions = { nx: textureSize, ny: textureSize, nz: textureSize };
+    } else {
+      this.gridDimensions = {
+        nx: textureSize.nx,
+        ny: textureSize.ny,
+        nz: textureSize.nz,
+      };
+      this.textureSize = textureSize.nx;
+    }
+    this.dt = this.computeStableTimeStep(this.cellSize);
+    this.alphaBetaDt = this.dt;
+    this.alphaBetaCellSize = this.cellSize;
+    this.initializeSampler();
+  }
+
+  public getTextureSize(): number {
+    return this.textureSize;
+  }
+
+  public getGridDimensions(): GridDimensions {
+    return { ...this.gridDimensions };
+  }
+
+  public setGridDimensions(dimensions: GridDimensions) {
+    this.gridDimensions = { ...dimensions };
+    // Preserve compatibility with existing 2D infrastructure until 3D textures land.
+    this.textureSize = dimensions.nx;
+  }
+
+  public getCellSize(): number {
+    return this.cellSize;
+  }
+
+  public getTimeStep(): number {
+    return this.dt;
+  }
+
+  public getLightSpeed(): number {
+    return this.lightSpeed;
+  }
+
+  public setCellSize(cellSize: number) {
+    if (!Number.isFinite(cellSize) || cellSize <= 0) {
+      throw new Error(`Invalid cell size: ${cellSize}`);
+    }
+    if (this.cellSize === cellSize) {
+      return;
+    }
+    this.cellSize = cellSize;
+    this.dt = this.computeStableTimeStep(cellSize);
+    this.alphaBetaDt = Number.NaN;
+    this.alphaBetaCellSize = Number.NaN;
+  }
+
+  private computeStableTimeStep(cellSize: number): number {
+    return this.courantFactor * cellSize / this.lightSpeed;
+  }
+
+  private initializeSampler() {
+    this.sampler = this.device.createSampler({
+      magFilter: 'linear',
+      minFilter: 'linear',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+    });
+  }
+
+  async initializePipelines(shaders: Record<string, string>) {
+    for (const [name, shader] of Object.entries(shaders)) {
+      try {
+        console.log(`Creating shader module: ${name}`);
+        const module = this.device.createShaderModule({
+          code: shader,
+          label: `${name}_shader_module`
+        });
+
+        // Check for compilation info
+        const compilationInfo = await module.getCompilationInfo();
+        if (compilationInfo.messages.length > 0) {
+          console.log(`Shader ${name} compilation info:`, compilationInfo.messages);
+          for (const message of compilationInfo.messages) {
+            console.log(`  ${message.type}: ${message.message} at line ${message.lineNum}, pos ${message.linePos}`);
+          }
+        }
+
+        const pipeline = this.device.createComputePipeline({
+          layout: 'auto',
+          compute: {
+            module,
+            entryPoint: 'main',
+          },
+          label: `${name}_pipeline`,
+        });
+        this.pipelines.set(name, pipeline);
+      } catch (error) {
+        console.error(`Error creating shader ${name}:`, error);
+        console.log(`Shader code for ${name}:`, shader);
+        throw error;
+      }
+    }
+  }
+
+  initializeTextures() {
+    // Create main field textures (double buffered)
+    this.createTexture('electricField', this.textureSize, this.textureSize);
+    this.createTexture('electricFieldNext', this.textureSize, this.textureSize);
+    this.createTexture('magneticField', this.textureSize, this.textureSize);
+    this.createTexture('magneticFieldNext', this.textureSize, this.textureSize);
+
+    // Create auxiliary textures
+    this.createTexture('alphaBetaField', this.textureSize, this.textureSize);
+    this.createTexture('materialField', this.textureSize, this.textureSize, 'rgba8unorm'); // Use widely supported filterable format
+    this.createTexture('sourceField', this.textureSize, this.textureSize);
+    this.createTexture('sourceFieldNext', this.textureSize, this.textureSize); // Add double buffer for source field
+
+    // Initialize dynamic field/source textures to zero to avoid undefined startup values.
+    this.clearDynamicTextures();
+
+    // Initialize material properties (vacuum by default)
+    this.initializeMaterialField();
+    this.initializeAlphaBeta();
+
+    // Initialize readback buffers for CPU access
+    this.initializeReadbackBuffers();
+
+    // Initialize reusable temp resources
+    this.initializeReusableResources();
+  }
+
+  private clearDynamicTextures() {
+    const names = [
+      'electricField',
+      'electricFieldNext',
+      'magneticField',
+      'magneticFieldNext',
+      'sourceField',
+      'sourceFieldNext',
+    ];
+
+    const zeroData = new Float32Array(this.textureSize * this.textureSize * 4);
+    const bytesPerRow = this.textureSize * 4 * 4;
+
+    for (const name of names) {
+      const texture = this.textures.get(name);
+      if (!texture) continue;
+      this.device.queue.writeTexture(
+        { texture },
+        zeroData,
+        { bytesPerRow },
+        { width: this.textureSize, height: this.textureSize }
+      );
+    }
+  }
+
+  public clearStaticSources() {
+    const zeroData = new Float32Array(this.textureSize * this.textureSize * 4);
+    const bytesPerRow = this.textureSize * 4 * 4;
+
+    const sourceCurrent = this.textures.get('sourceField');
+    if (sourceCurrent) {
+      this.device.queue.writeTexture(
+        { texture: sourceCurrent },
+        zeroData,
+        { bytesPerRow },
+        { width: this.textureSize, height: this.textureSize }
+      );
+    }
+
+    const sourceNext = this.textures.get('sourceFieldNext');
+    if (sourceNext) {
+      this.device.queue.writeTexture(
+        { texture: sourceNext },
+        zeroData,
+        { bytesPerRow },
+        { width: this.textureSize, height: this.textureSize }
+      );
+    }
+  }
+
+  private initializeReusableResources() {
+    // Create persistent temp texture for compute passes
+    this.tempTexture = this.device.createTexture({
+      size: [this.textureSize, this.textureSize],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+      label: 'temp_compute_texture'
+    });
+
+    // Create persistent parameter buffers
+    this.injectParamsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'inject_params_buffer'
+    });
+
+    this.decayParamsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      label: 'decay_params_buffer'
+    });
+
+    this.oscillatorBuffer = this.device.createBuffer({
+      size: this.maxOscillators * 32,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      label: 'oscillator_source_buffer'
+    });
+  }
+
+  private initializeReadbackBuffers() {
+    // Storage buffer for GPU to write field values
+    this.readbackBuffer = this.device.createBuffer({
+      size: 16, // 4 floats (Ex, Ey, Ez, magnitude)
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      label: 'readback_buffer'
+    });
+
+    // Staging buffer for CPU to read from
+    this.stagingBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      label: 'staging_buffer'
+    });
+  }
+
+  private initializeMaterialField() {
+    // Initialize with vacuum properties
+    // For rgba8unorm, values are automatically normalized to [0,1]
+    // Vacuum: permeability ≈ 1.0, permittivity ≈ 1.0, conductivity = 0
+    const materialData = new Uint8Array(this.textureSize * this.textureSize * 4);
+    for (let i = 0; i < materialData.length; i += 4) {
+      materialData[i] = 255; // permeability = 1.0 (vacuum)
+      materialData[i + 1] = 255; // permittivity = 1.0 (vacuum)
+      materialData[i + 2] = 0; // conductivity = 0 (no loss)
+      materialData[i + 3] = 255; // unused - full alpha
+    }
+
+    this.device.queue.writeTexture(
+      { texture: this.textures.get('materialField')! },
+      materialData,
+      { bytesPerRow: this.textureSize * 4 }, // rgba8unorm = 4 channels * 1 byte = 4 bytes per pixel
+      { width: this.textureSize, height: this.textureSize }
+    );
+  }
+
+  private initializeAlphaBeta() {
+    const simParams = new Float32Array([this.dt, this.cellSize, this.lightSpeed, 0]);
+    const simBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(simBuffer, 0, simParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('updateAlphaBeta')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('materialField')!.createView() },
+        { binding: 1, resource: { buffer: simBuffer } },
+        { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
+      ],
+    });
+
+    this.runComputePass('updateAlphaBeta', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+  }
+
+  createTexture(name: string, width: number, height: number, format: GPUTextureFormat = 'rgba16float') {
+    const texture = this.device.createTexture({
+      size: [width, height],
+      format,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+      label: `${name}_texture`,
+    });
+    this.textures.set(name, texture);
+    return texture;
+  }
+
+  createBuffer(name: string, size: number, usage: GPUBufferUsageFlags) {
+    const buffer = this.device.createBuffer({ size, usage });
+    this.buffers.set(name, buffer);
+    return buffer;
+  }
+
+  // Add a point charge source - Fixed to avoid circular reference
+  addPointCharge(x: number, y: number, charge: number) {
+    console.log(`Adding charge: x=${x}, y=${y}, charge=${charge}`);
+
+    const nx = (x + 1) * 0.5; // Convert from [-1,1] to [0,1]
+    const ny = (y + 1) * 0.5;
+
+    console.log(`Normalized position: nx=${nx}, ny=${ny}`);
+
+    const drawParams = new Float32Array([
+      nx, ny, // position in [0,1] space
+      0.05, 0.05, // smaller radius for point source
+      0, 0, charge * 1.0, 0, // reduced charge magnitude for smoother propagation
+      1, 1, 1, 1, // keep existing values (additive)
+    ]);
+
+    const paramsBuffer = this.device.createBuffer({
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, drawParams);
+
+    // Create temporary texture for drawing
+    const tempTexture = this.device.createTexture({
+      size: [this.textureSize, this.textureSize],
+      format: 'rgba16float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('drawEllipse')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('sourceField')!.createView() },
+        { binding: 1, resource: { buffer: paramsBuffer } },
+        { binding: 2, resource: tempTexture.createView() },
+      ],
+    });
+
+    this.runComputePass('drawEllipse', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    // Copy result back to source field
+    this.copyTexture(tempTexture, this.textures.get('sourceField')!);
+    tempTexture.destroy();
+    paramsBuffer.destroy();
+
+    console.log('Charge added successfully');
+  }
+
+  private copyTexture(source: GPUTexture, destination: GPUTexture) {
+    const commandEncoder = this.device.createCommandEncoder();
+    commandEncoder.copyTextureToTexture(
+      { texture: source },
+      { texture: destination },
+      [this.textureSize, this.textureSize]
+    );
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  // Main simulation step - Fixed to match reference implementation
+  step() {
+    const dt = this.dt;
+
+    // Step electric field (first half of time step)
+    this.stepElectric(dt);
+
+    // Step magnetic field (second half of time step) 
+    this.stepMagnetic(dt);
+  }
+
+  private stepElectric(dt: number) {
+    // Update alpha-beta if needed
+    this.updateAlphaBetaFromMaterial(dt);
+
+    // Inject sources into electric field
+    this.injectSources();
+
+    // Decay sources - DISABLED for static charge simulations
+    // For electrostatic fields, charge density should remain constant
+    // Only enable for dynamic/oscillating sources (antennas, etc.)
+    // this.decaySources();
+
+    // Update electric field
+    this.updateElectricField();
+
+    // Advance time by half step
+    this.time += dt / 2;
+  }
+
+  private stepMagnetic(dt: number) {
+    // Update magnetic field  
+    this.updateMagneticField();
+
+    // Advance time by half step
+    this.time += dt / 2;
+  }
+
+  private updateAlphaBetaFromMaterial(dt: number) {
+    // Update when either dt or cell size changed
+    if (this.alphaBetaDt !== dt || this.alphaBetaCellSize !== this.cellSize) {
+      this.alphaBetaDt = dt;
+      this.alphaBetaCellSize = this.cellSize;
+
+      const simParams = new Float32Array([dt, this.cellSize, this.lightSpeed, 0]);
+      const simBuffer = this.device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(simBuffer, 0, simParams);
+
+      const bindGroup = this.device.createBindGroup({
+        layout: this.pipelines.get('updateAlphaBeta')!.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.textures.get('materialField')!.createView() },
+          { binding: 1, resource: { buffer: simBuffer } },
+          { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
+        ],
+      });
+
+      this.runComputePass('updateAlphaBeta', bindGroup,
+        Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+      simBuffer.destroy();
+    }
+  }
+
+  private updateElectricField() {
+    // Swap electric field buffers before writing
+    this.swapElectricBuffers();
+
+    const fieldParams = new Float32Array([
+      1.0 / this.textureSize, 1.0 / this.textureSize, // relativeCellSize
+      0, 0, // reflectiveBoundary = false, padding
+    ]);
+
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, fieldParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('updateElectric')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('electricFieldNext')!.createView() }, // Previous electric field
+        { binding: 1, resource: this.textures.get('magneticField')!.createView() }, // Current magnetic field
+        { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+        { binding: 4, resource: this.textures.get('electricField')!.createView() }, // Write to current
+      ],
+    });
+
+    this.runComputePass('updateElectric', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    paramsBuffer.destroy();
+  }
+
+  private updateMagneticField() {
+    // Swap magnetic field buffers before writing
+    this.swapMagneticBuffers();
+
+    const fieldParams = new Float32Array([
+      1.0 / this.textureSize, 1.0 / this.textureSize, // relativeCellSize
+      0, 0, // reflectiveBoundary = false, padding
+    ]);
+
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, fieldParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('updateMagnetic')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('electricField')!.createView() }, // Current electric field
+        { binding: 1, resource: this.textures.get('magneticFieldNext')!.createView() }, // Previous magnetic field
+        { binding: 2, resource: this.textures.get('alphaBetaField')!.createView() },
+        { binding: 3, resource: { buffer: paramsBuffer } },
+        { binding: 4, resource: this.textures.get('magneticField')!.createView() }, // Write to current
+      ],
+    });
+
+    this.runComputePass('updateMagnetic', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    paramsBuffer.destroy();
+  }
+
+  private injectSources() {
+    // Swap source field buffers
+    this.swapSourceBuffers();
+
+    if (this.oscillatorBufferDirty) {
+      this.updateOscillatorBuffer();
+    }
+
+    const sourceParams = new Float32Array([
+      this.dt,
+      this.time,
+      this.oscillatingSources.length,
+      0,
+    ]);
+    this.device.queue.writeBuffer(this.injectParamsBuffer!, 0, sourceParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('injectSource')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('sourceFieldNext')!.createView() }, // Previous source field
+        { binding: 1, resource: this.textures.get('electricFieldNext')!.createView() }, // Previous electric field
+        { binding: 2, resource: { buffer: this.injectParamsBuffer! } },
+        { binding: 3, resource: this.tempTexture!.createView() },
+        { binding: 4, resource: { buffer: this.oscillatorBuffer! } },
+      ],
+    });
+
+    this.runComputePass('injectSource', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    // Copy result back to current electric field
+    this.copyTexture(this.tempTexture!, this.textures.get('electricField')!);
+  }
+
+  /* DISABLED: Source decay not needed for static electrostatic fields
+  private decaySources() {
+    // Pre-compute decay factor: exp(-ln(1000) * dt) ≈ 0.001^dt (very fast decay to prevent unbounded growth)
+    // With dt=0.001: decay ≈ 0.9931 per step, so after 1000 steps source field is ~0.37% of original
+    const decayFactor = Math.exp(-Math.LN10 * 3.0 * this.dt);
+    const decayParams = new Float32Array([decayFactor, 0, 0, 0]);
+    this.device.queue.writeBuffer(this.decayParamsBuffer!, 0, decayParams);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get('decaySource')!.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('sourceFieldNext')!.createView() }, // Previous source field
+        { binding: 1, resource: { buffer: this.decayParamsBuffer! } },
+        { binding: 2, resource: this.tempTexture!.createView() },
+      ],
+    });
+
+    this.runComputePass('decaySource', bindGroup,
+      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+
+    // Copy result back to current source field
+    this.copyTexture(this.tempTexture!, this.textures.get('sourceField')!);
+  }
+  */
+
+  private swapSourceBuffers() {
+    // Swap source field buffers
+    const temp = this.textures.get('sourceField');
+    this.textures.set('sourceField', this.textures.get('sourceFieldNext')!);
+    this.textures.set('sourceFieldNext', temp!);
+  }
+
+  private swapElectricBuffers() {
+    // Swap electric field buffers
+    const temp = this.textures.get('electricField');
+    this.textures.set('electricField', this.textures.get('electricFieldNext')!);
+    this.textures.set('electricFieldNext', temp!);
+  }
+
+  private swapMagneticBuffers() {
+    // Swap magnetic field buffers
+    const temp = this.textures.get('magneticField');
+    this.textures.set('magneticField', this.textures.get('magneticFieldNext')!);
+    this.textures.set('magneticFieldNext', temp!);
+  }
+
+  runComputePass(pipelineName: string, bindGroup: GPUBindGroup, workgroupsX: number, workgroupsY: number = 1, workgroupsZ: number = 1) {
+    const pipeline = this.pipelines.get(pipelineName);
+    if (!pipeline) throw new Error(`Pipeline ${pipelineName} not found`);
+
+    const commandEncoder = this.device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
+
+    computePass.setPipeline(pipeline);
+    computePass.setBindGroup(0, bindGroup);
+    computePass.dispatchWorkgroups(workgroupsX, workgroupsY, workgroupsZ);
+    computePass.end();
+
+    this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  getSampler() {
+    return this.sampler;
+  }
+
+  getTexture(name: string) {
+    return this.textures.get(name);
+  }
+
+  getBuffer(name: string) {
+    return this.buffers.get(name);
+  }
+
+  getPipeline(name: string) {
+    return this.pipelines.get(name);
+  }
+
+  getTime() {
+    return this.time;
+  }
+
+  setOscillatingSources(sources: OscillatingSource[]) {
+    if (sources.length > this.maxOscillators) {
+      throw new Error(`Too many oscillating sources (max ${this.maxOscillators})`);
+    }
+    this.oscillatingSources = sources.slice();
+    this.oscillatorBufferDirty = true;
+  }
+
+  addOscillatingSource(source: OscillatingSource) {
+    if (this.oscillatingSources.length + 1 > this.maxOscillators) {
+      throw new Error(`Too many oscillating sources (max ${this.maxOscillators})`);
+    }
+    this.oscillatingSources.push(source);
+    this.oscillatorBufferDirty = true;
+  }
+
+  clearOscillatingSources() {
+    this.oscillatingSources = [];
+    this.oscillatorBufferDirty = true;
+  }
+
+  private updateOscillatorBuffer() {
+    if (!this.oscillatorBuffer) return;
+
+    const strideFloats = 8;
+    const data = new Float32Array(this.maxOscillators * strideFloats);
+
+    for (let i = 0; i < this.oscillatingSources.length; i += 1) {
+      const source = this.oscillatingSources[i];
+      const baseIndex = i * strideFloats;
+      data[baseIndex] = source.position[0];
+      data[baseIndex + 1] = source.position[1];
+      data[baseIndex + 2] = source.radius;
+      data[baseIndex + 3] = source.amplitude;
+      data[baseIndex + 4] = source.frequency;
+      data[baseIndex + 5] = source.phase;
+      data[baseIndex + 6] = 0;
+      data[baseIndex + 7] = 0;
+    }
+
+    this.device.queue.writeBuffer(this.oscillatorBuffer, 0, data);
+    this.oscillatorBufferDirty = false;
+  }
+
+  /**
+   * Read the electric field value at a specific point (x, y in normalized [0,1] coordinates)
+   * Returns a promise with [Ex, Ey, Ez, magnitude]
+   */
+  async readFieldValueAt(x: number, y: number): Promise<Float32Array> {
+    // Return a promise that queues the readback
+    return new Promise<Float32Array>((resolve, reject) => {
+      this.readbackQueue.push({ x, y, resolve, reject });
+      this.processReadbackQueue();
+    });
+  }
+
+  async readFieldValueAt3D(x: number, y: number, _z: number): Promise<Float32Array> {
+    // Temporary compatibility shim until volumetric readback shader is implemented.
+    return this.readFieldValueAt(x, y);
+  }
+
+  private async processReadbackQueue() {
+    // If already processing, don't start another iteration
+    if (this.readbackInProgress) {
+      return;
+    }
+
+    // If queue is empty, nothing to do
+    if (this.readbackQueue.length === 0) {
+      return;
+    }
+
+    this.readbackInProgress = true;
+
+    try {
+      // Process all queued items
+      while (this.readbackQueue.length > 0) {
+        const item = this.readbackQueue.shift()!;
+
+        try {
+          const result = await this.performReadback(item.x, item.y);
+          item.resolve(result);
+        } catch (error) {
+          item.reject(error);
+        }
+      }
+    } finally {
+      this.readbackInProgress = false;
+    }
+  }
+
+  private async performReadback(x: number, y: number): Promise<Float32Array> {
+    if (!this.readbackBuffer || !this.stagingBuffer) {
+      throw new Error('Readback buffers not initialized');
+    }
+
+    // Ensure staging buffer is unmapped before use
+    if (this.stagingBufferMapped) {
+      try {
+        this.stagingBuffer.unmap();
+        this.stagingBufferMapped = false;
+      } catch (e) {
+        // Ignore unmap errors
+      }
+    }
+
+    // Create parameters buffer with point coordinates
+    const paramsData = new Float32Array([x, y, this.textureSize, 0]);
+    const paramsBuffer = this.device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
+
+    // Create bind group for readFieldValue shader
+    const pipeline = this.pipelines.get('readFieldValue');
+    if (!pipeline) {
+      throw new Error('readFieldValue pipeline not found');
+    }
+
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.textures.get('electricField')!.createView() },
+        { binding: 1, resource: { buffer: this.readbackBuffer } },
+        { binding: 2, resource: { buffer: paramsBuffer } },
+      ],
+    });
+
+    // Run compute shader to read field value
+    const commandEncoder = this.device.createCommandEncoder();
+    const computePass = commandEncoder.beginComputePass();
+    computePass.setPipeline(pipeline);
+    computePass.setBindGroup(0, bindGroup);
+    computePass.dispatchWorkgroups(1, 1, 1);
+    computePass.end();
+
+    // Copy from readback buffer to staging buffer
+    commandEncoder.copyBufferToBuffer(
+      this.readbackBuffer, 0,
+      this.stagingBuffer, 0,
+      16
+    );
+
+    this.device.queue.submit([commandEncoder.finish()]);
+
+    // Wait for GPU to finish the submitted work before mapping or destroying resources
+    await this.device.queue.onSubmittedWorkDone();
+
+    // Now safe to destroy the params buffer
+    paramsBuffer.destroy();
+
+    // Map staging buffer and read data - with proper error handling
+    try {
+      await this.stagingBuffer.mapAsync(GPUMapMode.READ);
+      this.stagingBufferMapped = true;
+
+      const mappedData = this.stagingBuffer.getMappedRange();
+      const data = new Float32Array(4);
+      data.set(new Float32Array(mappedData));
+
+      this.stagingBuffer.unmap();
+      this.stagingBufferMapped = false;
+
+      return data;
+    } catch (error) {
+      console.error('Failed to map staging buffer:', error);
+      throw error;
+    }
+  }
+
+  // Add cleanup method
+  destroy() {
+    // Unmap staging buffer if mapped
+    if (this.stagingBufferMapped && this.stagingBuffer) {
+      try {
+        this.stagingBuffer.unmap();
+      } catch (e) {
+        // Ignore unmap errors during cleanup
+      }
+    }
+
+    for (const texture of this.textures.values()) {
+      texture.destroy();
+    }
+    for (const buffer of this.buffers.values()) {
+      buffer.destroy();
+    }
+    if (this.readbackBuffer) {
+      this.readbackBuffer.destroy();
+    }
+    if (this.stagingBuffer) {
+      this.stagingBuffer.destroy();
+    }
+    if (this.tempTexture) {
+      this.tempTexture.destroy();
+    }
+    if (this.injectParamsBuffer) {
+      this.injectParamsBuffer.destroy();
+    }
+    if (this.decayParamsBuffer) {
+      this.decayParamsBuffer.destroy();
+    }
+    if (this.oscillatorBuffer) {
+      this.oscillatorBuffer.destroy();
+    }
+  }
+}

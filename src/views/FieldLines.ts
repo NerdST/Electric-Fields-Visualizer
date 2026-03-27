@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { electricFieldAt } from '../models/Charge';
-import type { Charge } from '../models/Charge';
+import type { Charge, ElectricFieldResult } from '../models/Charge';
+
+export type FieldSampler = (position: THREE.Vector3, charges: Charge[]) => ElectricFieldResult;
 
 export interface FieldLineConfig {
   stepSize: number; // Step size for numerical integration
@@ -11,18 +13,21 @@ export interface FieldLineConfig {
   color: number;
   opacity: number;
   linesPerCharge: number; // Number of field lines to start from each positive charge
+  fieldSampler?: FieldSampler;
 }
 
 export class FieldLineRenderer {
   private scene: THREE.Scene;
   private fieldLines: THREE.Line[] = [];
   private config: FieldLineConfig;
+  private readonly fieldSampler: FieldSampler;
   private charges: Charge[] = [];
   private lineGroup: THREE.Group;
 
   constructor(scene: THREE.Scene, config: FieldLineConfig) {
     this.scene = scene;
     this.config = config;
+    this.fieldSampler = config.fieldSampler ?? electricFieldAt;
     this.lineGroup = new THREE.Group();
     this.scene.add(this.lineGroup);
     this.createFieldLines();
@@ -64,14 +69,14 @@ export class FieldLineRenderer {
    * Get normalized field direction at a point
    */
   private getFieldDirection(position: THREE.Vector3, charges: Charge[]): THREE.Vector3 {
-    const fieldResult = electricFieldAt(position, charges);
+    const fieldResult = this.fieldSampler(position, charges);
     const field = fieldResult.field;
     const magnitude = field.length();
-    
+
     if (magnitude < 1e-6) {
       return new THREE.Vector3(0, 0, 0);
     }
-    
+
     return field.normalize();
   }
 
@@ -137,11 +142,11 @@ export class FieldLineRenderer {
 
       // Take a step
       const nextPos = this.rk4Step(currentPos, charges, stepSize * direction);
-      
+
       // Adaptive step sizing based on field strength
-      const fieldResult = electricFieldAt(currentPos, charges);
+      const fieldResult = this.fieldSampler(currentPos, charges);
       const fieldMagnitude = fieldResult.field.length();
-      
+
       if (fieldMagnitude > 1e6) {
         // Strong field - use smaller steps
         stepSize = Math.max(this.config.minStepSize, stepSize * 0.5);
@@ -210,7 +215,7 @@ export class FieldLineRenderer {
       for (const startPoint of startPoints) {
         // Trace forward (away from positive charge)
         const forwardPoints = this.traceFieldLine(startPoint, this.charges, true);
-        
+
         // Trace backward (toward positive charge) and reverse
         const backwardPoints = this.traceFieldLine(startPoint, this.charges, false);
         backwardPoints.reverse();

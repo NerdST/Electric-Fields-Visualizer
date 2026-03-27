@@ -2,12 +2,18 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
-import { createDefaultCharge, createCharge, electricFieldAt } from '../models/Charge';
+import { createDefaultCharge, createCharge } from '../models/Charge';
 import type { Charge } from '../models/Charge';
 import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../views/VectorField';
 import { FieldLineRenderer, createDefaultFieldLineConfig } from '../views/FieldLines';
 import { createVoltagePoint } from '../models/VoltagePoint';
 import type { VoltagePoint } from '../models/VoltagePoint';
+import {
+  createSimulationProvider,
+  type SimulationMode,
+  type SimulationProvider,
+  type SimulationStats,
+} from '../models/simulation/SimulationProvider';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -39,8 +45,6 @@ const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
 const chargeGeometry = new THREE.SphereGeometry(0.2, 16, 16);
 const positiveChargeMaterial = new THREE.MeshStandardMaterial({ color: 0xff4444 });
 const negativeChargeMaterial = new THREE.MeshStandardMaterial({ color: 0x4444ff });
-const voltageOrbGeometry = new THREE.SphereGeometry(0.15, 16, 16);
-const voltageOrbMaterial = new THREE.MeshStandardMaterial({ color: 0x00ff00 });
 
 // Add some default charges
 const charge1 = createDefaultCharge('charge-1');
@@ -121,7 +125,10 @@ const updateChargeMeshes = () => {
 };
 
 // Function to update voltage point meshes
-const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
+const updateVoltagePointMeshes = (
+  voltagePoints: VoltagePoint[],
+  sampleFieldAt: (position: THREE.Vector3) => { field: THREE.Vector3; potential: number },
+) => {
   const seen: Set<string> = new Set();
   const upVector = new THREE.Vector3(0, 1, 0);
   const sphereRadius = 0.15;
@@ -200,7 +207,7 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
       const arrowPos = arrowPositions[i];
 
       // Calculate electric field at this position
-      const fieldResult = electricFieldAt(arrowPos, charges);
+      const fieldResult = sampleFieldAt(arrowPos);
       const field = fieldResult.field;
 
       let arrowLength = field.length();
@@ -257,6 +264,44 @@ function animate() {
 
 const ThreeWorkspace: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [simulationMode, setSimulationMode] = useState<SimulationMode>('analytical');
+  const [simulationStats, setSimulationStats] = useState<SimulationStats>(
+    {
+      mode: 'analytical',
+      ready: true,
+      usingFallback: false,
+      steps: 0,
+      stepsPerSecond: 0,
+      dt: 0,
+      sampleCacheSize: 0,
+    },
+  );
+  const simulationProviderRef = useRef<SimulationProvider>(
+    createSimulationProvider('analytical'),
+  );
+
+  const sampleFieldAtPosition = useCallback((position: THREE.Vector3) => {
+    return simulationProviderRef.current.sampleFieldAt(position);
+  }, []);
+
+  const samplePotentialAtPosition = useCallback((position: THREE.Vector3) => {
+    return simulationProviderRef.current.samplePotentialAt(position);
+  }, []);
+
+  useEffect(() => {
+    simulationProviderRef.current.dispose();
+    simulationProviderRef.current = createSimulationProvider(simulationMode);
+    simulationProviderRef.current.setCharges(chargesState);
+    setSimulationStats(simulationProviderRef.current.getStats());
+
+    if (vectorFieldRenderer) {
+      vectorFieldRenderer.updateCharges(chargesState);
+    }
+    if (fieldLineRenderer) {
+      fieldLineRenderer.updateCharges(chargesState);
+    }
+  }, [simulationMode]);
+
   const [vectorFieldRenderer, setVectorFieldRenderer] =
     useState<VectorFieldRenderer | null>(null);
   const [showVectorField, setShowVectorField] = useState(true);
@@ -269,6 +314,7 @@ const ThreeWorkspace: React.FC = () => {
   const chargesRef = useRef<Charge[]>(chargesState);
   useEffect(() => {
     chargesRef.current = chargesState;
+    simulationProviderRef.current.setCharges(chargesState);
   }, [chargesState]);
 
   const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
@@ -312,12 +358,14 @@ const ThreeWorkspace: React.FC = () => {
   useEffect(() => {
     if (voltagePoints.length === 0) return;
     const updated = voltagePoints.map((point) => {
-      const fieldResult = electricFieldAt(point.position, chargesState);
-      return { ...point, voltage: fieldResult.potential };
+      return {
+        ...point,
+        voltage: samplePotentialAtPosition(point.position),
+      };
     });
     setVoltagePoints(updated);
-    updateVoltagePointMeshes(updated);
-  }, [chargesState]);
+    updateVoltagePointMeshes(updated, sampleFieldAtPosition);
+  }, [chargesState, sampleFieldAtPosition, samplePotentialAtPosition]);
 
   // Hover voltage readout
   const [hoverVoltage, setHoverVoltage] = useState<number | null>(null);
@@ -364,6 +412,7 @@ const ThreeWorkspace: React.FC = () => {
 
     const newCharges = [...chargesState, newCharge];
     charges = newCharges;
+    simulationProviderRef.current.upsertCharge(newCharge);
     setChargesState(newCharges);
     setChargeStack((prev) => [...prev, newCharge.id]);
     updateChargeMeshes();
@@ -374,6 +423,7 @@ const ThreeWorkspace: React.FC = () => {
     (chargeId: string) => {
       const newCharges = chargesState.filter((charge) => charge.id !== chargeId);
       charges = newCharges;
+      simulationProviderRef.current.removeCharge(chargeId);
       setChargesState(newCharges);
       setSelectedCharge(null);
       selectedChargeId = null;
@@ -395,6 +445,7 @@ const ThreeWorkspace: React.FC = () => {
 
   const removeAllCharges = useCallback(() => {
     charges = [];
+    simulationProviderRef.current.clearCharges();
     setChargesState([]);
     setSelectedCharge(null);
     setChargeStack([]);
@@ -420,7 +471,11 @@ const ThreeWorkspace: React.FC = () => {
       const newCharges = chargesState.map((charge) =>
         charge.id === chargeId ? { ...charge, magnitude } : charge,
       );
+      const updatedCharge = newCharges.find((charge) => charge.id === chargeId);
       charges = newCharges;
+      if (updatedCharge) {
+        simulationProviderRef.current.upsertCharge(updatedCharge);
+      }
       setChargesState(newCharges);
       updateChargeMeshes();
       scheduleVectorFieldUpdate(newCharges);
@@ -433,7 +488,11 @@ const ThreeWorkspace: React.FC = () => {
       const newCharges = chargesState.map((charge) =>
         charge.id === chargeId ? { ...charge, position: position.clone() } : charge,
       );
+      const updatedCharge = newCharges.find((charge) => charge.id === chargeId);
       charges = newCharges;
+      if (updatedCharge) {
+        simulationProviderRef.current.upsertCharge(updatedCharge);
+      }
       setChargesState(newCharges);
       updateChargeMeshes();
       if (vectorFieldRenderer && showVectorField) {
@@ -450,27 +509,26 @@ const ThreeWorkspace: React.FC = () => {
       newVoltagePoint.y,
       newVoltagePoint.z,
     );
-    const fieldResult = electricFieldAt(position, chargesRef.current);
-    const newPoint = createVoltagePoint(position, fieldResult.potential);
+    const newPoint = createVoltagePoint(position, samplePotentialAtPosition(position));
     const updated = [...voltagePoints, newPoint];
     setVoltagePoints(updated);
-    updateVoltagePointMeshes(updated);
+    updateVoltagePointMeshes(updated, sampleFieldAtPosition);
     setShowVoltagePointUI(false);
-  }, [newVoltagePoint, voltagePoints]);
+  }, [newVoltagePoint, sampleFieldAtPosition, samplePotentialAtPosition, voltagePoints]);
 
   const removeVoltagePoint = useCallback(
     (pointId: string) => {
       const newPoints = voltagePoints.filter((point) => point.id !== pointId);
       setVoltagePoints(newPoints);
-      updateVoltagePointMeshes(newPoints);
+      updateVoltagePointMeshes(newPoints, sampleFieldAtPosition);
     },
-    [voltagePoints],
+    [sampleFieldAtPosition, voltagePoints],
   );
 
   const removeAllVoltagePoints = useCallback(() => {
     setVoltagePoints([]);
-    updateVoltagePointMeshes([]);
-  }, []);
+    updateVoltagePointMeshes([], sampleFieldAtPosition);
+  }, [sampleFieldAtPosition]);
 
   const handleMouseClick = useCallback(
     (event: MouseEvent) => {
@@ -522,6 +580,7 @@ const ThreeWorkspace: React.FC = () => {
 
     if (!vectorFieldInitialized.current) {
       const vectorFieldConfig = createDefaultVectorFieldConfig();
+      vectorFieldConfig.fieldSampler = (position, _charges) => sampleFieldAtPosition(position);
       const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
       vfRenderer.updateCharges(charges);
       setVectorFieldRenderer(vfRenderer);
@@ -530,6 +589,7 @@ const ThreeWorkspace: React.FC = () => {
 
     if (!fieldLineInitialized.current) {
       const fieldLineConfig = createDefaultFieldLineConfig();
+      fieldLineConfig.fieldSampler = (position, _charges) => sampleFieldAtPosition(position);
       const flRenderer = new FieldLineRenderer(scene, fieldLineConfig);
       flRenderer.updateCharges(charges);
       flRenderer.setVisible(showFieldLines);
@@ -566,8 +626,7 @@ const ThreeWorkspace: React.FC = () => {
       if (result !== null) {
         const pos = intersectionPoint.clone();
         setHoverPosition(pos);
-        const fieldResult = electricFieldAt(pos, chargesRef.current);
-        setHoverVoltage(fieldResult.potential);
+        setHoverVoltage(samplePotentialAtPosition(pos));
       } else {
         setHoverPosition(null);
         setHoverVoltage(null);
@@ -592,12 +651,28 @@ const ThreeWorkspace: React.FC = () => {
         fieldLineRenderer.dispose();
       }
     };
-  }, [handleMouseClick, vectorFieldRenderer]);
+  }, [handleMouseClick, sampleFieldAtPosition, samplePotentialAtPosition, vectorFieldRenderer]);
 
   // Keep voltage point meshes in sync with state
   useEffect(() => {
-    updateVoltagePointMeshes(voltagePoints);
-  }, [voltagePoints]);
+    updateVoltagePointMeshes(voltagePoints, sampleFieldAtPosition);
+  }, [sampleFieldAtPosition, voltagePoints]);
+
+  useEffect(() => {
+    return () => {
+      simulationProviderRef.current.dispose();
+    };
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setSimulationStats(simulationProviderRef.current.getStats());
+    }, 250);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const toggleVectorField = () => {
     const newVisibility = !showVectorField;
@@ -639,6 +714,43 @@ const ThreeWorkspace: React.FC = () => {
       >
         <div style={{ fontSize: '14px', fontWeight: 'bold', marginBottom: '10px' }}>
           Electric Field Visualizer
+        </div>
+
+        <div style={{ marginBottom: '10px' }}>
+          <label style={{ display: 'block', marginBottom: '4px' }}>Simulation Mode:</label>
+          <select
+            value={simulationMode}
+            onChange={(e) => setSimulationMode(e.target.value as SimulationMode)}
+            style={{
+              width: '100%',
+              padding: '6px',
+              borderRadius: '3px',
+              border: '1px solid #555',
+              background: 'rgba(255, 255, 255, 0.1)',
+              color: 'white',
+              fontSize: '11px',
+            }}
+          >
+            <option value="analytical" style={{ color: '#111' }}>Analytical</option>
+            <option value="fdtd" style={{ color: '#111' }}>FDTD (WIP)</option>
+          </select>
+        </div>
+
+        <div
+          style={{
+            marginBottom: '10px',
+            padding: '6px',
+            borderRadius: '4px',
+            background: 'rgba(255,255,255,0.08)',
+            fontSize: '10px',
+          }}
+        >
+          <div>Status: {simulationStats.ready ? 'ready' : 'initializing'}</div>
+          <div>Fallback: {simulationStats.usingFallback ? 'yes' : 'no'}</div>
+          <div>Steps: {simulationStats.steps}</div>
+          <div>Steps/sec: {simulationStats.stepsPerSecond.toFixed(1)}</div>
+          <div>dt: {simulationStats.dt.toExponential(3)} s</div>
+          <div>Cache: {simulationStats.sampleCacheSize}</div>
         </div>
 
         <div style={{ marginBottom: '8px' }}>
