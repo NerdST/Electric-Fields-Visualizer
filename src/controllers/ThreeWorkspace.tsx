@@ -8,6 +8,8 @@ import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../views/Ve
 import { FieldLineRenderer, createDefaultFieldLineConfig } from '../views/FieldLines';
 import { createVoltagePoint } from '../models/VoltagePoint';
 import type { VoltagePoint } from '../models/VoltagePoint';
+import { computeTwoPointProbe } from '../models/TwoPointProbe';
+import type { TwoPointProbeResult } from '../models/TwoPointProbe';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -318,9 +320,29 @@ const ThreeWorkspace: React.FC = () => {
     updateVoltagePointMeshes(updated);
   }, [chargesState]);
 
-  // Hover voltage readout
   const [hoverVoltage, setHoverVoltage] = useState<number | null>(null);
   const [hoverPosition, setHoverPosition] = useState<THREE.Vector3 | null>(null);
+
+  const [probeMode, setProbeMode] = useState(false);
+  const [probePointA, setProbePointA] = useState<THREE.Vector3 | null>(null);
+  const [probeResult, setProbeResult] = useState<TwoPointProbeResult | null>(null);
+  const probeModeRef = useRef(false);
+  const probePointARef = useRef<THREE.Vector3 | null>(null);
+
+  useEffect(() => {
+    probeModeRef.current = probeMode;
+  }, [probeMode]);
+  useEffect(() => {
+    probePointARef.current = probePointA;
+  }, [probePointA]);
+
+  // Need it to recalculate probe result when charges change
+  useEffect(() => {
+    if (probeResult) {
+      const updated = computeTwoPointProbe(probeResult.pointA, probeResult.pointB, chargesState);
+      setProbeResult(updated);
+    }
+  }, [chargesState]);
 
   const vectorFieldInitialized = useRef(false);
   const fieldLineInitialized = useRef(false);
@@ -340,7 +362,6 @@ const ThreeWorkspace: React.FC = () => {
             vectorFieldRenderer.setVisible(true);
           }
         }
-        // Update field lines as well
         if (fieldLineRenderer) {
           fieldLineRenderer.updateCharges(nextCharges);
         }
@@ -349,7 +370,6 @@ const ThreeWorkspace: React.FC = () => {
     [vectorFieldRenderer, fieldLineRenderer, showVectorField],
   );
 
-  // Charge management
   const addCharge = useCallback(() => {
     const newCharge = createCharge(
       new THREE.Vector3(
@@ -480,6 +500,25 @@ const ThreeWorkspace: React.FC = () => {
       mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
       raycaster.setFromCamera(mouse, camera);
+
+      // Two-point probe: intercept clicks to place points on y=0 plane
+      if (probeModeRef.current) {
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+        const intersection = new THREE.Vector3();
+        const hit = raycaster.ray.intersectPlane(plane, intersection);
+        if (!hit) return;
+
+        if (!probePointARef.current) {
+          setProbePointA(intersection.clone());
+        } else {
+          const result = computeTwoPointProbe(probePointARef.current, intersection.clone(), chargesRef.current);
+          setProbeResult(result);
+          setProbeMode(false);
+          setProbePointA(null);
+        }
+        return;
+      }
+
       const chargeIntersects = raycaster.intersectObjects(
         Array.from(chargeMeshes.values()),
       );
