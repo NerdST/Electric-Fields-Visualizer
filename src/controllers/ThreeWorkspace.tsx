@@ -811,6 +811,96 @@ const ThreeWorkspace: React.FC = () => {
           Add Voltage Measurement (by coordinates)
         </button>
 
+        <button
+          onClick={() => {
+            setProbeMode(!probeMode);
+            setProbePointA(null);
+            setProbeResult(null);
+          }}
+          style={{
+            padding: '8px 12px',
+            background: probeMode ? '#ff9800' : '#9C27B0',
+            color: 'white',
+            border: 'none',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            marginBottom: '10px',
+            fontSize: '11px',
+            width: '100%',
+          }}
+        >
+          {probeMode ? 'Cancel Probe' : 'Two-Point Probe'}
+        </button>
+
+        {probeMode && (
+          <div
+            style={{
+              marginBottom: '10px',
+              padding: '8px',
+              background: 'rgba(156, 39, 176, 0.2)',
+              border: '1px solid #9C27B0',
+              borderRadius: '4px',
+              fontSize: '11px',
+            }}
+          >
+            {!probePointA
+              ? 'Click on the grid to place Point A'
+              : 'Click on the grid to place Point B'}
+          </div>
+        )}
+
+        {probeResult && !probeMode && (
+          <div
+            style={{
+              marginBottom: '10px',
+              padding: '10px',
+              background: 'rgba(156, 39, 176, 0.15)',
+              border: '1px solid #9C27B0',
+              borderRadius: '4px',
+              fontSize: '11px',
+            }}
+          >
+            <div style={{ fontWeight: 'bold', marginBottom: '6px' }}>
+              Two-Point Probe Results
+            </div>
+            <div style={{ marginBottom: '3px' }}>
+              A: ({probeResult.pointA.x.toFixed(2)}, {probeResult.pointA.y.toFixed(2)}, {probeResult.pointA.z.toFixed(2)})
+            </div>
+            <div style={{ marginBottom: '3px' }}>
+              B: ({probeResult.pointB.x.toFixed(2)}, {probeResult.pointB.y.toFixed(2)}, {probeResult.pointB.z.toFixed(2)})
+            </div>
+            <div style={{ marginBottom: '3px' }}>
+              V(A): {probeResult.voltageA.toExponential(2)} V
+            </div>
+            <div style={{ marginBottom: '3px' }}>
+              V(B): {probeResult.voltageB.toExponential(2)} V
+            </div>
+            <div style={{ marginBottom: '3px', color: '#ce93d8' }}>
+              {'\u0394'}V: {probeResult.deltaV.toExponential(2)} V
+            </div>
+            <div style={{ marginBottom: '3px' }}>
+              Distance: {probeResult.distance.toFixed(3)} m
+            </div>
+            <div style={{ marginBottom: '6px', color: '#ce93d8' }}>
+              {'\u222B'}E{'\u00B7'}dl: {probeResult.eDotDl.toExponential(2)} V/m{'\u00B7'}m
+            </div>
+            <button
+              onClick={() => setProbeResult(null)}
+              style={{
+                padding: '4px 8px',
+                background: '#f44336',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: 'pointer',
+                fontSize: '10px',
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        )}
+
         {selectedCharge && (
           <div
             style={{
