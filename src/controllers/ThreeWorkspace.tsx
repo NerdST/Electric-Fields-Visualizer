@@ -944,6 +944,166 @@ const ThreeWorkspace: React.FC = () => {
           </div>
         )}
 
+        <button
+          onClick={() => {
+            if (lineProbeMode) {
+              // Cancel
+              setLineProbeMode(false);
+              setLineProbeWaypoints([]);
+            } else {
+              setLineProbeMode(true);
+              setLineProbeWaypoints([]);
+              setLineProbeResult(null);
+            }
+          }}
+          style={{
+            padding: '8px 12px',
+            background: lineProbeMode ? '#ff9800' : '#00897B',
+            color: 'white',
+            border: 'none',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            marginBottom: '10px',
+            fontSize: '11px',
+            width: '100%',
+          }}
+        >
+          {lineProbeMode ? 'Cancel Path' : 'Line Path Probe'}
+        </button>
+
+        {lineProbeMode && (
+          <div
+            style={{
+              marginBottom: '10px',
+              padding: '8px',
+              background: 'rgba(0, 137, 123, 0.2)',
+              border: '1px solid #00897B',
+              borderRadius: '4px',
+              fontSize: '11px',
+            }}
+          >
+            <div>Waypoints placed: {lineProbeWaypoints.length}</div>
+            <div style={{ fontSize: '10px', color: '#aaa', marginTop: '2px' }}>
+              Click on the grid to add waypoints (min 2)
+            </div>
+            {lineProbeWaypoints.length >= 2 && (
+              <button
+                onClick={finishLinePath}
+                style={{
+                  marginTop: '6px',
+                  padding: '6px 10px',
+                  background: '#4CAF50',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '3px',
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  width: '100%',
+                }}
+              >
+                Finish Path ({lineProbeWaypoints.length} points)
+              </button>
+            )}
+          </div>
+        )}
+
+        {lineProbeResult && !lineProbeMode && (
+          <div
+            style={{
+              marginBottom: '10px',
+              padding: '10px',
+              background: 'rgba(0, 137, 123, 0.15)',
+              border: '1px solid #00897B',
+              borderRadius: '4px',
+              fontSize: '11px',
+            }}
+          >
+            <div style={{ fontWeight: 'bold', marginBottom: '6px' }}>
+              Line Probe Results
+            </div>
+            <div style={{ marginBottom: '3px' }}>
+              Waypoints: {lineProbeResult.waypoints.length} | Distance: {lineProbeResult.totalDistance.toFixed(2)} m
+            </div>
+
+            {/* Mini SVG graph of voltage along path */}
+            {lineProbeResult.data.length > 1 && (() => {
+              const graphW = 230;
+              const graphH = 80;
+              const pad = { top: 10, right: 10, bottom: 20, left: 10 };
+              const w = graphW - pad.left - pad.right;
+              const h = graphH - pad.top - pad.bottom;
+
+              const data = lineProbeResult.data;
+              const maxDist = data[data.length - 1].distance || 1;
+              const voltages = data.map(d => d.voltage);
+              const minV = Math.min(...voltages);
+              const maxV = Math.max(...voltages);
+              const rangeV = maxV - minV || 1;
+
+              const voltagePath = data
+                .map((d, i) => {
+                  const x = pad.left + (d.distance / maxDist) * w;
+                  const y = pad.top + h - ((d.voltage - minV) / rangeV) * h;
+                  return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+                })
+                .join(' ');
+
+              const fieldMags = data.map(d => d.fieldMagnitude);
+              const minF = Math.min(...fieldMags);
+              const maxF = Math.max(...fieldMags);
+              const rangeF = maxF - minF || 1;
+
+              const fieldPath = data
+                .map((d, i) => {
+                  const x = pad.left + (d.distance / maxDist) * w;
+                  const y = pad.top + h - ((d.fieldMagnitude - minF) / rangeF) * h;
+                  return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+                })
+                .join(' ');
+
+              return (
+                <div>
+                  <svg width={graphW} height={graphH} style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '3px' }}>
+                    {/* Axis line */}
+                    <line x1={pad.left} y1={pad.top + h} x2={pad.left + w} y2={pad.top + h} stroke="#555" strokeWidth={1} />
+                    {/* Voltage line (yellow) */}
+                    <path d={voltagePath} fill="none" stroke="#ffeb3b" strokeWidth={1.5} />
+                    {/* Field magnitude line (cyan) */}
+                    <path d={fieldPath} fill="none" stroke="#00e5ff" strokeWidth={1.5} />
+                    {/* Labels */}
+                    <text x={pad.left} y={graphH - 2} fill="#ffeb3b" fontSize="8">V</text>
+                    <text x={pad.left + 12} y={graphH - 2} fill="#00e5ff" fontSize="8">|E|</text>
+                    <text x={pad.left + w} y={graphH - 2} fill="#888" fontSize="8" textAnchor="end">
+                      {maxDist.toFixed(1)}m
+                    </text>
+                  </svg>
+                  <div style={{ fontSize: '9px', color: '#aaa', marginTop: '2px' }}>
+                    <span style={{ color: '#ffeb3b' }}>V</span>: {minV.toExponential(1)} to {maxV.toExponential(1)} V
+                    {' | '}
+                    <span style={{ color: '#00e5ff' }}>|E|</span>: {minF.toExponential(1)} to {maxF.toExponential(1)}
+                  </div>
+                </div>
+              );
+            })()}
+
+            <button
+              onClick={() => setLineProbeResult(null)}
+              style={{
+                marginTop: '6px',
+                padding: '4px 8px',
+                background: '#f44336',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: 'pointer',
+                fontSize: '10px',
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        )}
+
         {selectedCharge && (
           <div
             style={{
