@@ -270,12 +270,16 @@ const ThreeWorkspace: React.FC = () => {
       mode: 'analytical',
       ready: true,
       usingFallback: false,
+      paused: true,
+      targetStepsPerSecond: 0,
       steps: 0,
       stepsPerSecond: 0,
       dt: 0,
       sampleCacheSize: 0,
     },
   );
+  const [fdtdPaused, setFdtdPaused] = useState(false);
+  const [fdtdTargetSps, setFdtdTargetSps] = useState(240);
   const simulationProviderRef = useRef<SimulationProvider>(
     createSimulationProvider('analytical'),
   );
@@ -292,6 +296,8 @@ const ThreeWorkspace: React.FC = () => {
     simulationProviderRef.current.dispose();
     simulationProviderRef.current = createSimulationProvider(simulationMode);
     simulationProviderRef.current.setCharges(chargesState);
+    simulationProviderRef.current.setSimulationPaused(fdtdPaused);
+    simulationProviderRef.current.setTargetStepsPerSecond(fdtdTargetSps);
     setSimulationStats(simulationProviderRef.current.getStats());
 
     if (vectorFieldRenderer) {
@@ -674,6 +680,14 @@ const ThreeWorkspace: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    simulationProviderRef.current.setSimulationPaused(fdtdPaused);
+  }, [fdtdPaused, simulationMode]);
+
+  useEffect(() => {
+    simulationProviderRef.current.setTargetStepsPerSecond(fdtdTargetSps);
+  }, [fdtdTargetSps, simulationMode]);
+
   const toggleVectorField = () => {
     const newVisibility = !showVectorField;
     setShowVectorField(newVisibility);
@@ -747,11 +761,55 @@ const ThreeWorkspace: React.FC = () => {
         >
           <div>Status: {simulationStats.ready ? 'ready' : 'initializing'}</div>
           <div>Fallback: {simulationStats.usingFallback ? 'yes' : 'no'}</div>
+          <div>Paused: {simulationStats.paused ? 'yes' : 'no'}</div>
+          <div>Target SPS: {simulationStats.targetStepsPerSecond}</div>
           <div>Steps: {simulationStats.steps}</div>
           <div>Steps/sec: {simulationStats.stepsPerSecond.toFixed(1)}</div>
           <div>dt: {simulationStats.dt.toExponential(3)} s</div>
           <div>Cache: {simulationStats.sampleCacheSize}</div>
         </div>
+
+        {simulationMode === 'fdtd' && (
+          <div
+            style={{
+              marginBottom: '10px',
+              padding: '8px',
+              borderRadius: '4px',
+              background: 'rgba(33,150,243,0.12)',
+              border: '1px solid rgba(33,150,243,0.35)',
+            }}
+          >
+            <button
+              onClick={() => setFdtdPaused((prev) => !prev)}
+              style={{
+                width: '100%',
+                padding: '6px',
+                marginBottom: '8px',
+                border: 'none',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                color: 'white',
+                background: fdtdPaused ? '#4CAF50' : '#f57c00',
+                fontSize: '11px',
+              }}
+            >
+              {fdtdPaused ? 'Resume Simulation' : 'Pause Simulation'}
+            </button>
+
+            <label style={{ display: 'block', fontSize: '10px', marginBottom: '4px' }}>
+              Target Steps/sec: {fdtdTargetSps}
+            </label>
+            <input
+              type="range"
+              min={30}
+              max={1000}
+              step={10}
+              value={fdtdTargetSps}
+              onChange={(e) => setFdtdTargetSps(parseInt(e.target.value, 10))}
+              style={{ width: '100%' }}
+            />
+          </div>
+        )}
 
         <div style={{ marginBottom: '8px' }}>
           <div>Charges: {chargesState.length}</div>

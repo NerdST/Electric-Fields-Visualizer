@@ -13,6 +13,8 @@ export type GridDimensions = {
   nz: number;
 };
 
+export type StorageMode = '2d' | '3d';
+
 export class FDTDSimulation {
   private device: GPUDevice;
   private pipelines: Map<string, GPUComputePipeline> = new Map();
@@ -21,6 +23,7 @@ export class FDTDSimulation {
   private sampler!: GPUSampler;
   private textureSize: number;
   private gridDimensions: GridDimensions;
+  private storageMode: StorageMode = '2d';
   private readonly lightSpeed: number = 299_792_458;
   private readonly courantFactor: number = 0.5;
   private dt: number = 0;
@@ -32,7 +35,7 @@ export class FDTDSimulation {
   private stagingBuffer: GPUBuffer | null = null;
   private stagingBufferMapped: boolean = false; // Track if staging buffer is mapped
   private readbackInProgress: boolean = false; // Prevent concurrent readback calls
-  private readbackQueue: Array<{ x: number; y: number; resolve: (data: Float32Array) => void; reject: (err: any) => void }> = [];
+  private readbackQueue: Array<{ x: number; y: number; z?: number; resolve: (data: Float32Array) => void; reject: (err: any) => void }> = [];
 
   // Reusable resources to avoid allocation churn
   private tempTexture: GPUTexture | null = null;
@@ -74,6 +77,14 @@ export class FDTDSimulation {
     this.gridDimensions = { ...dimensions };
     // Preserve compatibility with existing 2D infrastructure until 3D textures land.
     this.textureSize = dimensions.nx;
+  }
+
+  public getStorageMode(): StorageMode {
+    return this.storageMode;
+  }
+
+  public setStorageMode(mode: StorageMode) {
+    this.storageMode = mode;
   }
 
   public getCellSize(): number {
@@ -151,16 +162,16 @@ export class FDTDSimulation {
 
   initializeTextures() {
     // Create main field textures (double buffered)
-    this.createTexture('electricField', this.textureSize, this.textureSize);
-    this.createTexture('electricFieldNext', this.textureSize, this.textureSize);
-    this.createTexture('magneticField', this.textureSize, this.textureSize);
-    this.createTexture('magneticFieldNext', this.textureSize, this.textureSize);
+    this.createFieldTexture('electricField');
+    this.createFieldTexture('electricFieldNext');
+    this.createFieldTexture('magneticField');
+    this.createFieldTexture('magneticFieldNext');
 
     // Create auxiliary textures
-    this.createTexture('alphaBetaField', this.textureSize, this.textureSize);
-    this.createTexture('materialField', this.textureSize, this.textureSize, 'rgba8unorm'); // Use widely supported filterable format
-    this.createTexture('sourceField', this.textureSize, this.textureSize);
-    this.createTexture('sourceFieldNext', this.textureSize, this.textureSize); // Add double buffer for source field
+    this.createFieldTexture('alphaBetaField');
+    this.createFieldTexture('materialField', 'rgba8unorm'); // Use widely supported filterable format
+    this.createFieldTexture('sourceField');
+    this.createFieldTexture('sourceFieldNext'); // Add double buffer for source field
 
     // Initialize dynamic field/source textures to zero to avoid undefined startup values.
     this.clearDynamicTextures();
@@ -255,6 +266,26 @@ export class FDTDSimulation {
     });
   }
 
+  private getTextureExtent3D(): [number, number, number] {
+    if (this.storageMode === '3d') {
+      return [this.gridDimensions.nx, this.gridDimensions.ny, this.gridDimensions.nz];
+    }
+    return [this.textureSize, this.textureSize, 1];
+  }
+
+  private createFieldTexture(name: string, format: GPUTextureFormat = 'rgba16float') {
+    if (this.storageMode === '3d') {
+      return this.createTexture3D(
+        name,
+        this.gridDimensions.nx,
+        this.gridDimensions.ny,
+        this.gridDimensions.nz,
+        format,
+      );
+    }
+    return this.createTexture2D(name, this.textureSize, this.textureSize, format);
+  }
+
   private initializeReadbackBuffers() {
     // Storage buffer for GPU to write field values
     this.readbackBuffer = this.device.createBuffer({
@@ -312,7 +343,7 @@ export class FDTDSimulation {
       Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
   }
 
-  createTexture(name: string, width: number, height: number, format: GPUTextureFormat = 'rgba16float') {
+  createTexture2D(name: string, width: number, height: number, format: GPUTextureFormat = 'rgba16float') {
     const texture = this.device.createTexture({
       size: [width, height],
       format,
@@ -321,6 +352,28 @@ export class FDTDSimulation {
     });
     this.textures.set(name, texture);
     return texture;
+  }
+
+  createTexture3D(
+    name: string,
+    width: number,
+    height: number,
+    depth: number,
+    format: GPUTextureFormat = 'rgba16float',
+  ) {
+    const texture = this.device.createTexture({
+      size: [width, height, depth],
+      format,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
+      label: `${name}_texture_3d`,
+    });
+    this.textures.set(name, texture);
+    return texture;
+  }
+
+  // Backward-compatible alias while the solver migrates to explicit 2D/3D calls.
+  createTexture(name: string, width: number, height: number, format: GPUTextureFormat = 'rgba16float') {
+    return this.createTexture2D(name, width, height, format);
   }
 
   createBuffer(name: string, size: number, usage: GPUBufferUsageFlags) {
@@ -380,10 +433,11 @@ export class FDTDSimulation {
 
   private copyTexture(source: GPUTexture, destination: GPUTexture) {
     const commandEncoder = this.device.createCommandEncoder();
+    const extent = this.getTextureExtent3D();
     commandEncoder.copyTextureToTexture(
       { texture: source },
       { texture: destination },
-      [this.textureSize, this.textureSize]
+      extent
     );
     this.device.queue.submit([commandEncoder.finish()]);
   }
@@ -614,6 +668,20 @@ export class FDTDSimulation {
     this.device.queue.submit([commandEncoder.finish()]);
   }
 
+  runComputePass2D(pipelineName: string, bindGroup: GPUBindGroup, workgroupsX: number, workgroupsY: number = 1) {
+    this.runComputePass(pipelineName, bindGroup, workgroupsX, workgroupsY, 1);
+  }
+
+  runComputePass3D(
+    pipelineName: string,
+    bindGroup: GPUBindGroup,
+    workgroupsX: number,
+    workgroupsY: number,
+    workgroupsZ: number,
+  ) {
+    this.runComputePass(pipelineName, bindGroup, workgroupsX, workgroupsY, workgroupsZ);
+  }
+
   getSampler() {
     return this.sampler;
   }
@@ -690,9 +758,41 @@ export class FDTDSimulation {
     });
   }
 
-  async readFieldValueAt3D(x: number, y: number, _z: number): Promise<Float32Array> {
-    // Temporary compatibility shim until volumetric readback shader is implemented.
-    return this.readFieldValueAt(x, y);
+  async readFieldValueAt3D(x: number, y: number, z: number): Promise<Float32Array> {
+    const has3DPipeline = this.pipelines.has('readFieldValue3D');
+    if (!has3DPipeline) {
+      return this.readFieldValueAt(x, y);
+    }
+
+    return new Promise<Float32Array>((resolve, reject) => {
+      this.readbackQueue.push({ x, y, z, resolve, reject });
+      this.processReadbackQueue3D();
+    });
+  }
+
+  private async processReadbackQueue3D() {
+    if (this.readbackInProgress) {
+      return;
+    }
+
+    if (this.readbackQueue.length === 0) {
+      return;
+    }
+
+    this.readbackInProgress = true;
+    try {
+      while (this.readbackQueue.length > 0) {
+        const item = this.readbackQueue.shift()!;
+        try {
+          const result = await this.performReadback(item.x, item.y, item.z ?? 0, 'readFieldValue3D');
+          item.resolve(result);
+        } catch (error) {
+          item.reject(error);
+        }
+      }
+    } finally {
+      this.readbackInProgress = false;
+    }
   }
 
   private async processReadbackQueue() {
@@ -714,7 +814,7 @@ export class FDTDSimulation {
         const item = this.readbackQueue.shift()!;
 
         try {
-          const result = await this.performReadback(item.x, item.y);
+          const result = await this.performReadback(item.x, item.y, item.z ?? 0, 'readFieldValue');
           item.resolve(result);
         } catch (error) {
           item.reject(error);
@@ -725,7 +825,12 @@ export class FDTDSimulation {
     }
   }
 
-  private async performReadback(x: number, y: number): Promise<Float32Array> {
+  private async performReadback(
+    x: number,
+    y: number,
+    z: number = 0,
+    pipelineName: 'readFieldValue' | 'readFieldValue3D' = 'readFieldValue',
+  ): Promise<Float32Array> {
     if (!this.readbackBuffer || !this.stagingBuffer) {
       throw new Error('Readback buffers not initialized');
     }
@@ -741,7 +846,9 @@ export class FDTDSimulation {
     }
 
     // Create parameters buffer with point coordinates
-    const paramsData = new Float32Array([x, y, this.textureSize, 0]);
+    const paramsData = pipelineName === 'readFieldValue3D'
+      ? new Float32Array([x, y, z, this.textureSize])
+      : new Float32Array([x, y, this.textureSize, 0]);
     const paramsBuffer = this.device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -749,9 +856,9 @@ export class FDTDSimulation {
     this.device.queue.writeBuffer(paramsBuffer, 0, paramsData);
 
     // Create bind group for readFieldValue shader
-    const pipeline = this.pipelines.get('readFieldValue');
+    const pipeline = this.pipelines.get(pipelineName);
     if (!pipeline) {
-      throw new Error('readFieldValue pipeline not found');
+      throw new Error(`${pipelineName} pipeline not found`);
     }
 
     const bindGroup = this.device.createBindGroup({
