@@ -10,6 +10,8 @@ import { createVoltagePoint } from '../models/VoltagePoint';
 import type { VoltagePoint } from '../models/VoltagePoint';
 import { computeTwoPointProbe } from '../models/TwoPointProbe';
 import type { TwoPointProbeResult } from '../models/TwoPointProbe';
+import { computeLineProbe } from '../models/LineProbe';
+import type { LineProbeResult } from '../models/LineProbe';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -344,6 +346,37 @@ const ThreeWorkspace: React.FC = () => {
     }
   }, [chargesState]);
 
+  // Line probe state
+  const [lineProbeMode, setLineProbeMode] = useState(false);
+  const [lineProbeWaypoints, setLineProbeWaypoints] = useState<THREE.Vector3[]>([]);
+  const [lineProbeResult, setLineProbeResult] = useState<LineProbeResult | null>(null);
+  const lineProbeModeRef = useRef(false);
+  const lineProbeWaypointsRef = useRef<THREE.Vector3[]>([]);
+
+  useEffect(() => {
+    lineProbeModeRef.current = lineProbeMode;
+  }, [lineProbeMode]);
+  useEffect(() => {
+    lineProbeWaypointsRef.current = lineProbeWaypoints;
+  }, [lineProbeWaypoints]);
+
+  useEffect(() => {
+    if (lineProbeResult && lineProbeResult.waypoints.length >= 2) {
+      const updated = computeLineProbe(lineProbeResult.waypoints, chargesState);
+      setLineProbeResult(updated);
+    }
+  }, [chargesState]);
+
+  const finishLinePath = useCallback(() => {
+    const waypoints = lineProbeWaypointsRef.current;
+    if (waypoints.length >= 2) {
+      const result = computeLineProbe(waypoints, chargesRef.current);
+      setLineProbeResult(result);
+    }
+    setLineProbeMode(false);
+    setLineProbeWaypoints([]);
+  }, []);
+
   const vectorFieldInitialized = useRef(false);
   const fieldLineInitialized = useRef(false);
   const vfUpdateScheduled = useRef(false);
@@ -516,6 +549,16 @@ const ThreeWorkspace: React.FC = () => {
           setProbeMode(false);
           setProbePointA(null);
         }
+        return;
+      }
+
+      if (lineProbeModeRef.current) {
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+        const intersection = new THREE.Vector3();
+        const hit = raycaster.ray.intersectPlane(plane, intersection);
+        if (!hit) return;
+
+        setLineProbeWaypoints(prev => [...prev, intersection.clone()]);
         return;
       }
 
