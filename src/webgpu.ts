@@ -1,7 +1,20 @@
 import { FDTDSimulation } from './models/FDTDSimulation';
+import type { StorageMode } from './models/FDTDSimulation';
 import { loadComputeShaders } from './models/loadShaders';
 
+type InitializeFDTDOptions = {
+    storageMode?: StorageMode;
+};
+
 export async function initializeWebGPUWithFDTD(): Promise<{
+    device: GPUDevice;
+    fdtdSim: FDTDSimulation;
+}>;
+export async function initializeWebGPUWithFDTD(options: InitializeFDTDOptions): Promise<{
+    device: GPUDevice;
+    fdtdSim: FDTDSimulation;
+}>;
+export async function initializeWebGPUWithFDTD(options: InitializeFDTDOptions = {}): Promise<{
     device: GPUDevice;
     fdtdSim: FDTDSimulation;
 }> {
@@ -16,6 +29,7 @@ export async function initializeWebGPUWithFDTD(): Promise<{
 
     const device = await adapter.requestDevice();
     const fdtdSim = new FDTDSimulation(device);
+    fdtdSim.setStorageMode(options.storageMode ?? '2d');
     const computeShaders = await loadComputeShaders();
     await fdtdSim.initializePipelines(computeShaders);
     fdtdSim.initializeTextures();

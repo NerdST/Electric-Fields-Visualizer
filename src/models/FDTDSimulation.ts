@@ -760,7 +760,8 @@ export class FDTDSimulation {
 
   async readFieldValueAt3D(x: number, y: number, z: number): Promise<Float32Array> {
     const has3DPipeline = this.pipelines.has('readFieldValue3D');
-    if (!has3DPipeline) {
+    const canUse3D = has3DPipeline && this.storageMode === '3d';
+    if (!canUse3D) {
       return this.readFieldValueAt(x, y);
     }
 
@@ -847,7 +848,7 @@ export class FDTDSimulation {
 
     // Create parameters buffer with point coordinates
     const paramsData = pipelineName === 'readFieldValue3D'
-      ? new Float32Array([x, y, z, this.textureSize])
+      ? new Float32Array([x, y, z, 0])
       : new Float32Array([x, y, this.textureSize, 0]);
     const paramsBuffer = this.device.createBuffer({
       size: 16,

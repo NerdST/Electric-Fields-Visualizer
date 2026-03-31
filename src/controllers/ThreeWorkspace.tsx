@@ -4,6 +4,12 @@ import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { createDefaultCharge, createCharge } from '../models/Charge';
 import type { Charge } from '../models/Charge';
+import {
+  createDefaultSource,
+  evaluateSourcesToCharges,
+  type SimulationSource,
+  type SourceWaveformType,
+} from '../models/SimulationSource';
 import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../views/VectorField';
 import { FieldLineRenderer, createDefaultFieldLineConfig } from '../views/FieldLines';
 import { createVoltagePoint } from '../models/VoltagePoint';
@@ -50,6 +56,9 @@ const negativeChargeMaterial = new THREE.MeshStandardMaterial({ color: 0x4444ff 
 const charge1 = createDefaultCharge('charge-1');
 charge1.position.set(0, 0, 0);
 charge1.magnitude = 1e-6;
+
+const source1 = createDefaultSource('charge-1', charge1.position.clone());
+source1.waveform.offset = charge1.magnitude;
 
 let charges: Charge[] = [charge1];
 
@@ -265,12 +274,14 @@ function animate() {
 const ThreeWorkspace: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [simulationMode, setSimulationMode] = useState<SimulationMode>('analytical');
+  const [remoteServerUrl, setRemoteServerUrl] = useState('ws://localhost:8765/ws');
   const [simulationStats, setSimulationStats] = useState<SimulationStats>(
     {
       mode: 'analytical',
       ready: true,
       usingFallback: false,
       paused: true,
+      storageMode: '2d',
       targetStepsPerSecond: 0,
       steps: 0,
       stepsPerSecond: 0,
@@ -292,9 +303,16 @@ const ThreeWorkspace: React.FC = () => {
     return simulationProviderRef.current.samplePotentialAt(position);
   }, []);
 
+  const [simulationTimeSeconds, setSimulationTimeSeconds] = useState(0);
+  const [simulationClockRunning, setSimulationClockRunning] = useState(true);
+  const [simulationTimeScale, setSimulationTimeScale] = useState(1);
+  const [sourceDefs, setSourceDefs] = useState<SimulationSource[]>([source1]);
+  const simulationClockRef = useRef<number | null>(null);
+  const lastFrameTimeRef = useRef<number | null>(null);
+
   useEffect(() => {
     simulationProviderRef.current.dispose();
-    simulationProviderRef.current = createSimulationProvider(simulationMode);
+    simulationProviderRef.current = createSimulationProvider(simulationMode, remoteServerUrl);
     simulationProviderRef.current.setCharges(chargesState);
     simulationProviderRef.current.setSimulationPaused(fdtdPaused);
     simulationProviderRef.current.setTargetStepsPerSecond(fdtdTargetSps);
@@ -306,7 +324,7 @@ const ThreeWorkspace: React.FC = () => {
     if (fieldLineRenderer) {
       fieldLineRenderer.updateCharges(chargesState);
     }
-  }, [simulationMode]);
+  }, [simulationMode, remoteServerUrl]);
 
   const [vectorFieldRenderer, setVectorFieldRenderer] =
     useState<VectorFieldRenderer | null>(null);
@@ -322,6 +340,49 @@ const ThreeWorkspace: React.FC = () => {
     chargesRef.current = chargesState;
     simulationProviderRef.current.setCharges(chargesState);
   }, [chargesState]);
+
+  useEffect(() => {
+    const evaluatedCharges = evaluateSourcesToCharges(sourceDefs, simulationTimeSeconds);
+    charges = evaluatedCharges;
+    setChargesState(evaluatedCharges);
+    updateChargeMeshes();
+    if (vectorFieldRenderer) {
+      vectorFieldRenderer.updateCharges(evaluatedCharges);
+    }
+    if (fieldLineRenderer) {
+      fieldLineRenderer.updateCharges(evaluatedCharges);
+    }
+  }, [fieldLineRenderer, simulationTimeSeconds, sourceDefs, vectorFieldRenderer]);
+
+  useEffect(() => {
+    if (!simulationClockRunning) {
+      if (simulationClockRef.current !== null) {
+        cancelAnimationFrame(simulationClockRef.current);
+        simulationClockRef.current = null;
+      }
+      lastFrameTimeRef.current = null;
+      return;
+    }
+
+    const tick = (timestamp: number) => {
+      if (lastFrameTimeRef.current === null) {
+        lastFrameTimeRef.current = timestamp;
+      }
+      const dtSeconds = (timestamp - lastFrameTimeRef.current) / 1000;
+      lastFrameTimeRef.current = timestamp;
+      setSimulationTimeSeconds((prev) => prev + dtSeconds * simulationTimeScale);
+      simulationClockRef.current = requestAnimationFrame(tick);
+    };
+
+    simulationClockRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (simulationClockRef.current !== null) {
+        cancelAnimationFrame(simulationClockRef.current);
+        simulationClockRef.current = null;
+      }
+    };
+  }, [simulationClockRunning, simulationTimeScale]);
 
   const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
   const [chargeStack, setChargeStack] = useState<string[]>([]);
@@ -379,31 +440,6 @@ const ThreeWorkspace: React.FC = () => {
 
   const vectorFieldInitialized = useRef(false);
   const fieldLineInitialized = useRef(false);
-  const vfUpdateScheduled = useRef(false);
-
-  const scheduleVectorFieldUpdate = useCallback(
-    (nextCharges: Charge[]) => {
-      if (!vectorFieldRenderer) return;
-      if (vfUpdateScheduled.current) return;
-      vfUpdateScheduled.current = true;
-      requestAnimationFrame(() => {
-        vfUpdateScheduled.current = false;
-        if (vectorFieldRenderer) {
-          const shouldBeVisible = showVectorField;
-          vectorFieldRenderer.updateCharges(nextCharges);
-          if (shouldBeVisible) {
-            vectorFieldRenderer.setVisible(true);
-          }
-        }
-        // Update field lines as well
-        if (fieldLineRenderer) {
-          fieldLineRenderer.updateCharges(nextCharges);
-        }
-      });
-    },
-    [vectorFieldRenderer, fieldLineRenderer, showVectorField],
-  );
-
   // Charge management
   const addCharge = useCallback(() => {
     const newCharge = createCharge(
@@ -416,30 +452,21 @@ const ThreeWorkspace: React.FC = () => {
       `charge-${Date.now()}`,
     );
 
-    const newCharges = [...chargesState, newCharge];
-    charges = newCharges;
-    simulationProviderRef.current.upsertCharge(newCharge);
-    setChargesState(newCharges);
+    const newSource = createDefaultSource(newCharge.id, newCharge.position);
+    newSource.waveform.offset = newCharge.magnitude;
+    setSourceDefs((prev) => [...prev, newSource]);
     setChargeStack((prev) => [...prev, newCharge.id]);
-    updateChargeMeshes();
-    scheduleVectorFieldUpdate(newCharges);
-  }, [chargesState, scheduleVectorFieldUpdate]);
+  }, []);
 
   const removeCharge = useCallback(
     (chargeId: string) => {
-      const newCharges = chargesState.filter((charge) => charge.id !== chargeId);
-      charges = newCharges;
-      simulationProviderRef.current.removeCharge(chargeId);
-      setChargesState(newCharges);
+      setSourceDefs((prev) => prev.filter((source) => source.id !== chargeId));
       setSelectedCharge(null);
       selectedChargeId = null;
 
       setChargeStack((prev) => prev.filter((id) => id !== chargeId));
-
-      updateChargeMeshes();
-      scheduleVectorFieldUpdate(newCharges);
     },
-    [chargesState, scheduleVectorFieldUpdate],
+    [],
   );
 
   const removeLastAdded = useCallback(() => {
@@ -450,15 +477,11 @@ const ThreeWorkspace: React.FC = () => {
   }, [chargeStack, removeCharge]);
 
   const removeAllCharges = useCallback(() => {
-    charges = [];
-    simulationProviderRef.current.clearCharges();
-    setChargesState([]);
+    setSourceDefs([]);
     setSelectedCharge(null);
     setChargeStack([]);
     selectedChargeId = null;
-    updateChargeMeshes();
-    scheduleVectorFieldUpdate([]);
-  }, [scheduleVectorFieldUpdate]);
+  }, []);
 
   const selectCharge = useCallback(
     (chargeId: string) => {
@@ -474,38 +497,33 @@ const ThreeWorkspace: React.FC = () => {
 
   const updateChargeMagnitude = useCallback(
     (chargeId: string, magnitude: number) => {
-      const newCharges = chargesState.map((charge) =>
-        charge.id === chargeId ? { ...charge, magnitude } : charge,
-      );
-      const updatedCharge = newCharges.find((charge) => charge.id === chargeId);
-      charges = newCharges;
-      if (updatedCharge) {
-        simulationProviderRef.current.upsertCharge(updatedCharge);
-      }
-      setChargesState(newCharges);
-      updateChargeMeshes();
-      scheduleVectorFieldUpdate(newCharges);
+      setSourceDefs((prev) => prev.map((source) => (
+        source.id === chargeId
+          ? {
+            ...source,
+            waveform: {
+              ...source.waveform,
+              offset: magnitude,
+            },
+          }
+          : source
+      )));
     },
-    [chargesState, scheduleVectorFieldUpdate],
+    [],
   );
 
   const updateChargePosition = useCallback(
     (chargeId: string, position: THREE.Vector3) => {
-      const newCharges = chargesState.map((charge) =>
-        charge.id === chargeId ? { ...charge, position: position.clone() } : charge,
-      );
-      const updatedCharge = newCharges.find((charge) => charge.id === chargeId);
-      charges = newCharges;
-      if (updatedCharge) {
-        simulationProviderRef.current.upsertCharge(updatedCharge);
-      }
-      setChargesState(newCharges);
-      updateChargeMeshes();
-      if (vectorFieldRenderer && showVectorField) {
-        scheduleVectorFieldUpdate(newCharges);
-      }
+      setSourceDefs((prev) => prev.map((source) => (
+        source.id === chargeId
+          ? {
+            ...source,
+            position: position.clone(),
+          }
+          : source
+      )));
     },
-    [chargesState, scheduleVectorFieldUpdate, vectorFieldRenderer, showVectorField],
+    [],
   );
 
   // Voltage point management (points store physically computed potentials)
@@ -704,6 +722,32 @@ const ThreeWorkspace: React.FC = () => {
     }
   };
 
+  const selectedSource = selectedCharge
+    ? sourceDefs.find((source) => source.id === selectedCharge.id) ?? null
+    : null;
+
+  const updateSelectedSourceWaveform = (
+    field: 'type' | 'offset' | 'amplitude' | 'frequencyHz' | 'phaseRad' | 'dutyCycle',
+    value: number | SourceWaveformType,
+  ) => {
+    if (!selectedSource) {
+      return;
+    }
+
+    setSourceDefs((prev) => prev.map((source) => {
+      if (source.id !== selectedSource.id) {
+        return source;
+      }
+      return {
+        ...source,
+        waveform: {
+          ...source.waveform,
+          [field]: value,
+        },
+      };
+    }));
+  };
+
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh' }}>
       <div
@@ -747,8 +791,34 @@ const ThreeWorkspace: React.FC = () => {
           >
             <option value="analytical" style={{ color: '#111' }}>Analytical</option>
             <option value="fdtd" style={{ color: '#111' }}>FDTD (WIP)</option>
+            <option value="remote" style={{ color: '#111' }}>Remote FDTD</option>
           </select>
         </div>
+
+        {simulationMode === 'remote' && (
+          <div style={{ marginBottom: '10px' }}>
+            <label style={{ display: 'block', marginBottom: '4px' }}>Remote Server URL:</label>
+            <input
+              type="text"
+              value={remoteServerUrl}
+              onChange={(e) => setRemoteServerUrl(e.target.value)}
+              placeholder="ws://localhost:8765/ws"
+              style={{
+                width: '100%',
+                padding: '6px',
+                borderRadius: '3px',
+                border: `1px solid ${simulationStats.ready ? '#4c4' : '#c44'}`,
+                background: 'rgba(255, 255, 255, 0.1)',
+                color: 'white',
+                fontSize: '10px',
+                boxSizing: 'border-box',
+              }}
+            />
+            <div style={{ fontSize: '10px', marginTop: '3px', color: simulationStats.ready ? '#4c4' : '#f88' }}>
+              {simulationStats.ready ? 'Connected' : 'Disconnected — check server URL'}
+            </div>
+          </div>
+        )}
 
         <div
           style={{
@@ -762,11 +832,70 @@ const ThreeWorkspace: React.FC = () => {
           <div>Status: {simulationStats.ready ? 'ready' : 'initializing'}</div>
           <div>Fallback: {simulationStats.usingFallback ? 'yes' : 'no'}</div>
           <div>Paused: {simulationStats.paused ? 'yes' : 'no'}</div>
+          <div>Storage: {simulationStats.storageMode}</div>
           <div>Target SPS: {simulationStats.targetStepsPerSecond}</div>
           <div>Steps: {simulationStats.steps}</div>
           <div>Steps/sec: {simulationStats.stepsPerSecond.toFixed(1)}</div>
           <div>dt: {simulationStats.dt.toExponential(3)} s</div>
           <div>Cache: {simulationStats.sampleCacheSize}</div>
+        </div>
+
+        <div
+          style={{
+            marginBottom: '10px',
+            padding: '8px',
+            borderRadius: '4px',
+            background: 'rgba(255,255,255,0.08)',
+          }}
+        >
+          <div style={{ fontSize: '11px', marginBottom: '6px' }}>Simulation Clock</div>
+          <div style={{ fontSize: '10px', marginBottom: '6px' }}>
+            t = {simulationTimeSeconds.toFixed(4)} s
+          </div>
+          <button
+            onClick={() => setSimulationClockRunning((prev) => !prev)}
+            style={{
+              width: '100%',
+              padding: '6px',
+              marginBottom: '6px',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              color: 'white',
+              background: simulationClockRunning ? '#f57c00' : '#4CAF50',
+              fontSize: '11px',
+            }}
+          >
+            {simulationClockRunning ? 'Pause Time' : 'Run Time'}
+          </button>
+          <button
+            onClick={() => setSimulationTimeSeconds((prev) => prev + (1 / 120) * simulationTimeScale)}
+            style={{
+              width: '100%',
+              padding: '6px',
+              marginBottom: '6px',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              color: 'white',
+              background: '#546E7A',
+              fontSize: '11px',
+            }}
+          >
+            Step +dt
+          </button>
+          <label style={{ display: 'block', fontSize: '10px', marginBottom: '4px' }}>
+            Time Scale: {simulationTimeScale.toFixed(2)}x
+          </label>
+          <input
+            type="range"
+            min={0.1}
+            max={5}
+            step={0.1}
+            value={simulationTimeScale}
+            onChange={(e) => setSimulationTimeScale(parseFloat(e.target.value))}
+            style={{ width: '100%' }}
+          />
         </div>
 
         {simulationMode === 'fdtd' && (
@@ -813,6 +942,7 @@ const ThreeWorkspace: React.FC = () => {
 
         <div style={{ marginBottom: '8px' }}>
           <div>Charges: {chargesState.length}</div>
+          <div>Sources: {sourceDefs.length}</div>
           <div style={{ fontSize: '10px', color: '#ccc' }}>
             Click charges to select, click empty space to add a voltage point
           </div>
@@ -850,7 +980,7 @@ const ThreeWorkspace: React.FC = () => {
               fontSize: '11px',
             }}
           >
-            + Add Charge
+            + Add Source
           </button>
 
           {chargeStack.length > 0 && (
@@ -943,7 +1073,7 @@ const ThreeWorkspace: React.FC = () => {
           Add Voltage Measurement (by coordinates)
         </button>
 
-        {selectedCharge && (
+        {selectedCharge && selectedSource && (
           <div
             style={{
               border: '1px solid #555',
@@ -954,6 +1084,27 @@ const ThreeWorkspace: React.FC = () => {
           >
             <div style={{ fontWeight: 'bold', marginBottom: '8px' }}>
               Selected Charge: {selectedCharge.id}
+            </div>
+
+            <div style={{ marginBottom: '5px' }}>
+              <label style={{ display: 'block', marginBottom: '2px' }}>Source Type:</label>
+              <select
+                value={selectedSource.waveform.type}
+                onChange={(e) => updateSelectedSourceWaveform('type', e.target.value as SourceWaveformType)}
+                style={{
+                  width: '100%',
+                  padding: '4px',
+                  borderRadius: '3px',
+                  border: '1px solid #555',
+                  background: 'rgba(255, 255, 255, 0.1)',
+                  color: 'white',
+                  fontSize: '11px',
+                }}
+              >
+                <option value="dc" style={{ color: '#111' }}>DC</option>
+                <option value="sine" style={{ color: '#111' }}>Sine</option>
+                <option value="pulse" style={{ color: '#111' }}>Pulse</option>
+              </select>
             </div>
 
             <div style={{ marginBottom: '5px' }}>
@@ -978,6 +1129,79 @@ const ThreeWorkspace: React.FC = () => {
                 }}
               />
             </div>
+
+            {selectedSource.waveform.type !== 'dc' && (
+              <>
+                <div style={{ marginBottom: '5px' }}>
+                  <label style={{ display: 'block', marginBottom: '2px' }}>
+                    Amplitude (μC):
+                  </label>
+                  <input
+                    type="number"
+                    value={(selectedSource.waveform.amplitude * 1e6).toFixed(2)}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!Number.isNaN(v)) {
+                        updateSelectedSourceWaveform('amplitude', v * 1e-6);
+                      }
+                    }}
+                    style={{
+                      width: '100%',
+                      padding: '4px',
+                      borderRadius: '3px',
+                      border: '1px solid #555',
+                      background: 'rgba(255, 255, 255, 0.1)',
+                      color: 'white',
+                      fontSize: '11px',
+                    }}
+                  />
+                </div>
+
+                <div style={{ marginBottom: '5px' }}>
+                  <label style={{ display: 'block', marginBottom: '2px' }}>
+                    Frequency (Hz):
+                  </label>
+                  <input
+                    type="number"
+                    value={selectedSource.waveform.frequencyHz}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!Number.isNaN(v)) {
+                        updateSelectedSourceWaveform('frequencyHz', Math.max(0.001, v));
+                      }
+                    }}
+                    style={{
+                      width: '100%',
+                      padding: '4px',
+                      borderRadius: '3px',
+                      border: '1px solid #555',
+                      background: 'rgba(255, 255, 255, 0.1)',
+                      color: 'white',
+                      fontSize: '11px',
+                    }}
+                  />
+                </div>
+              </>
+            )}
+
+            {selectedSource.waveform.type === 'pulse' && (
+              <div style={{ marginBottom: '5px' }}>
+                <label style={{ display: 'block', marginBottom: '2px' }}>
+                  Duty Cycle:
+                </label>
+                <input
+                  type="range"
+                  min={0.05}
+                  max={0.95}
+                  step={0.01}
+                  value={selectedSource.waveform.dutyCycle}
+                  onChange={(e) => {
+                    updateSelectedSourceWaveform('dutyCycle', parseFloat(e.target.value));
+                  }}
+                  style={{ width: '100%' }}
+                />
+              </div>
+            )}
 
             <div style={{ marginBottom: '5px' }}>
               <label style={{ display: 'block', marginBottom: '2px' }}>Position X:</label>

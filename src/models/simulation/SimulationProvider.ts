@@ -2,15 +2,17 @@ import * as THREE from 'three';
 import { electricFieldAt } from '../Charge';
 import type { Charge, ElectricFieldResult } from '../Charge';
 import { initializeWebGPUWithFDTD } from '../../webgpu';
-import type { FDTDSimulation } from '../FDTDSimulation';
+import type { FDTDSimulation, StorageMode } from '../FDTDSimulation';
+import { RemoteSimulationProvider } from './RemoteSimulationProvider';
 
-export type SimulationMode = 'analytical' | 'fdtd';
+export type SimulationMode = 'analytical' | 'fdtd' | 'remote';
 
 export type SimulationStats = {
     mode: SimulationMode;
     ready: boolean;
     usingFallback: boolean;
     paused: boolean;
+    storageMode: StorageMode;
     targetStepsPerSecond: number;
     steps: number;
     stepsPerSecond: number;
@@ -79,6 +81,7 @@ export class AnalyticalSimulationProvider implements SimulationProvider {
             ready: true,
             usingFallback: false,
             paused: true,
+            storageMode: '2d',
             targetStepsPerSecond: 0,
             steps: 0,
             stepsPerSecond: 0,
@@ -117,15 +120,18 @@ class FDTDSimulationProvider implements SimulationProvider {
     private lastRateUpdateMs = 0;
     private targetStepsPerSecond = 240;
     private paused = false;
+    private readonly storageMode: StorageMode;
 
     constructor(bounds: Bounds = DEFAULT_BOUNDS) {
         this.bounds = bounds;
+        const requestedMode = window.localStorage.getItem('fdtd-storage-mode');
+        this.storageMode = requestedMode === '3d' ? '3d' : '2d';
         this.readyPromise = this.initialize();
     }
 
     private async initialize(): Promise<void> {
         try {
-            const { fdtdSim } = await initializeWebGPUWithFDTD();
+            const { fdtdSim } = await initializeWebGPUWithFDTD({ storageMode: this.storageMode });
             if (this.disposed) {
                 fdtdSim.destroy();
                 return;
@@ -204,6 +210,7 @@ class FDTDSimulationProvider implements SimulationProvider {
             ready: this.fdtdSimulation !== null,
             usingFallback: this.fdtdSimulation === null,
             paused: this.paused,
+            storageMode: this.storageMode,
             targetStepsPerSecond: this.targetStepsPerSecond,
             steps: this.totalSteps,
             stepsPerSecond: this.stepsPerSecond,
@@ -362,9 +369,15 @@ class FDTDSimulationProvider implements SimulationProvider {
     }
 }
 
-export function createSimulationProvider(mode: SimulationMode): SimulationProvider {
+export function createSimulationProvider(mode: SimulationMode, serverUrl?: string): SimulationProvider {
     if (mode === 'fdtd') {
         return new FDTDSimulationProvider();
     }
+    if (mode === 'remote') {
+        const url = serverUrl ?? 'ws://localhost:8765/ws';
+        return new RemoteSimulationProvider(url);
+    }
     return new AnalyticalSimulationProvider();
 }
+
+export { RemoteSimulationProvider };
