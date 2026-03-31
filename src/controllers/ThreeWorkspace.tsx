@@ -12,6 +12,8 @@ import { computeTwoPointProbe } from '../models/TwoPointProbe';
 import type { TwoPointProbeResult } from '../models/TwoPointProbe';
 import { computeLineProbe } from '../models/LineProbe';
 import type { LineProbeResult } from '../models/LineProbe';
+import { FDTDSimulation3D, createDefaultFDTDConfig } from '../simulation/FDTDSimulation3D';
+import { FDTDVectorFieldRenderer } from '../views/FDTDVectorField';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -252,9 +254,36 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
 // Initialize charge meshes
 updateChargeMeshes();
 
+// FDTD simulation (module-level so it persists across React re-renders)
+const fdtdConfig = createDefaultFDTDConfig();
+const fdtdSimulation = new FDTDSimulation3D(fdtdConfig);
+const fdtdVectorField = new FDTDVectorFieldRenderer(scene, fdtdSimulation);
+
+// Add a default source at grid center — z-polarized oscillating dipole
+fdtdSimulation.addSource({
+  ix: Math.floor(fdtdConfig.nx / 2),
+  iy: Math.floor(fdtdConfig.ny / 2),
+  iz: Math.floor(fdtdConfig.nz / 2),
+  frequency: 3e9,    // 3 GHz — microwave, ~10cm wavelength (fits in our grid)
+  amplitude: 1.0,
+  polarization: 'z',
+});
+
+let fdtdRunning = false;
+const FDTD_STEPS_PER_FRAME = 5; // Multiple steps per render for faster wave propagation
+
 function animate() {
   requestAnimationFrame(animate);
   if (controls) controls.update();
+
+  // Advance FDTD simulation if running
+  if (fdtdRunning) {
+    for (let i = 0; i < FDTD_STEPS_PER_FRAME; i++) {
+      fdtdSimulation.step();
+    }
+    fdtdVectorField.update();
+  }
+
   renderer.render(scene, camera);
 }
 
@@ -330,6 +359,13 @@ const ThreeWorkspace: React.FC = () => {
   const [probeResult, setProbeResult] = useState<TwoPointProbeResult | null>(null);
   const probeModeRef = useRef(false);
   const probePointARef = useRef<THREE.Vector3 | null>(null);
+
+  // Coordinate inputs for two-point probe
+  const [probeInputA, setProbeInputA] = useState({ x: '0', y: '0', z: '0' });
+  const [probeInputB, setProbeInputB] = useState({ x: '1', y: '0', z: '0' });
+
+  // Coordinate input for line probe waypoint entry
+  const [lineProbeInput, setLineProbeInput] = useState({ x: '0', y: '0', z: '0' });
 
   useEffect(() => {
     probeModeRef.current = probeMode;
@@ -696,6 +732,18 @@ const ThreeWorkspace: React.FC = () => {
     }
   };
 
+  const [fdtdActive, setFdtdActive] = useState(false);
+
+  const toggleFDTD = () => {
+    const newState = !fdtdActive;
+    setFdtdActive(newState);
+    fdtdRunning = newState;
+    fdtdVectorField.setVisible(newState);
+    if (newState) {
+      fdtdSimulation.reset();
+    }
+  };
+
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh' }}>
       <div
@@ -832,6 +880,34 @@ const ThreeWorkspace: React.FC = () => {
           >
             {showFieldLines ? 'Hide' : 'Show'} Field Lines
           </button>
+          <button
+            onClick={toggleFDTD}
+            style={{
+              padding: '8px 12px',
+              background: fdtdActive ? '#4CAF50' : '#f44336',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              fontSize: '11px',
+              width: '100%',
+              marginTop: '5px',
+            }}
+          >
+            {fdtdActive ? 'Stop' : 'Start'} Wave Simulation (FDTD)
+          </button>
+          {fdtdActive && (
+            <div style={{
+              fontSize: '10px',
+              color: '#aaa',
+              marginTop: '4px',
+              padding: '4px',
+              background: 'rgba(255,255,255,0.05)',
+              borderRadius: '3px',
+            }}>
+              Step: {fdtdSimulation.getStepCount()} | Time: {fdtdSimulation.getCurrentTime().toExponential(2)}s
+            </div>
+          )}
         </div>
 
         <button
@@ -889,6 +965,94 @@ const ThreeWorkspace: React.FC = () => {
             {!probePointA
               ? 'Click on the grid to place Point A'
               : 'Click on the grid to place Point B'}
+          </div>
+        )}
+
+        {/* Two-point probe: enter coordinates manually */}
+        {!probeMode && !probeResult && (
+          <div
+            style={{
+              marginBottom: '10px',
+              padding: '8px',
+              background: 'rgba(156, 39, 176, 0.1)',
+              border: '1px solid #555',
+              borderRadius: '4px',
+              fontSize: '11px',
+            }}
+          >
+            <div style={{ fontWeight: 'bold', marginBottom: '6px' }}>Probe by Coordinates</div>
+            <div style={{ marginBottom: '4px' }}>Point A:</div>
+            <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
+              {(['x', 'y', 'z'] as const).map((axis) => (
+                <input
+                  key={`a-${axis}`}
+                  type="number"
+                  value={probeInputA[axis]}
+                  onChange={(e) => setProbeInputA(prev => ({ ...prev, [axis]: e.target.value }))}
+                  placeholder={axis}
+                  style={{
+                    flex: 1,
+                    padding: '3px',
+                    background: 'rgba(255,255,255,0.1)',
+                    color: 'white',
+                    border: '1px solid #555',
+                    borderRadius: '3px',
+                    fontSize: '11px',
+                    width: '50px',
+                  }}
+                />
+              ))}
+            </div>
+            <div style={{ marginBottom: '4px' }}>Point B:</div>
+            <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
+              {(['x', 'y', 'z'] as const).map((axis) => (
+                <input
+                  key={`b-${axis}`}
+                  type="number"
+                  value={probeInputB[axis]}
+                  onChange={(e) => setProbeInputB(prev => ({ ...prev, [axis]: e.target.value }))}
+                  placeholder={axis}
+                  style={{
+                    flex: 1,
+                    padding: '3px',
+                    background: 'rgba(255,255,255,0.1)',
+                    color: 'white',
+                    border: '1px solid #555',
+                    borderRadius: '3px',
+                    fontSize: '11px',
+                    width: '50px',
+                  }}
+                />
+              ))}
+            </div>
+            <button
+              onClick={() => {
+                const a = new THREE.Vector3(
+                  parseFloat(probeInputA.x) || 0,
+                  parseFloat(probeInputA.y) || 0,
+                  parseFloat(probeInputA.z) || 0,
+                );
+                const b = new THREE.Vector3(
+                  parseFloat(probeInputB.x) || 0,
+                  parseFloat(probeInputB.y) || 0,
+                  parseFloat(probeInputB.z) || 0,
+                );
+                const result = computeTwoPointProbe(a, b, chargesRef.current);
+                setProbeResult(result);
+              }}
+              style={{
+                padding: '6px 10px',
+                background: '#9C27B0',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: 'pointer',
+                fontSize: '11px',
+                width: '100%',
+              }}
+            >
+              Compute
+            </button>
           </div>
         )}
 
@@ -983,9 +1147,53 @@ const ThreeWorkspace: React.FC = () => {
             }}
           >
             <div>Waypoints placed: {lineProbeWaypoints.length}</div>
-            <div style={{ fontSize: '10px', color: '#aaa', marginTop: '2px' }}>
-              Click on the grid to add waypoints (min 2)
+            <div style={{ fontSize: '10px', color: '#aaa', marginTop: '2px', marginBottom: '6px' }}>
+              Click on the grid or type coordinates below (min 2)
             </div>
+            <div style={{ display: 'flex', gap: '4px', marginBottom: '4px' }}>
+              {(['x', 'y', 'z'] as const).map((axis) => (
+                <input
+                  key={`lp-${axis}`}
+                  type="number"
+                  value={lineProbeInput[axis]}
+                  onChange={(e) => setLineProbeInput(prev => ({ ...prev, [axis]: e.target.value }))}
+                  placeholder={axis}
+                  style={{
+                    flex: 1,
+                    padding: '3px',
+                    background: 'rgba(255,255,255,0.1)',
+                    color: 'white',
+                    border: '1px solid #555',
+                    borderRadius: '3px',
+                    fontSize: '11px',
+                    width: '50px',
+                  }}
+                />
+              ))}
+            </div>
+            <button
+              onClick={() => {
+                const pt = new THREE.Vector3(
+                  parseFloat(lineProbeInput.x) || 0,
+                  parseFloat(lineProbeInput.y) || 0,
+                  parseFloat(lineProbeInput.z) || 0,
+                );
+                setLineProbeWaypoints(prev => [...prev, pt]);
+              }}
+              style={{
+                padding: '5px 8px',
+                background: '#00897B',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: 'pointer',
+                fontSize: '10px',
+                width: '100%',
+                marginBottom: '6px',
+              }}
+            >
+              + Add Waypoint
+            </button>
             {lineProbeWaypoints.length >= 2 && (
               <button
                 onClick={finishLinePath}
