@@ -44,6 +44,15 @@ export interface FieldSource {
   amplitude: number;
   /** Which E component to inject into: 'x' | 'y' | 'z' */
   polarization: 'x' | 'y' | 'z';
+  /**
+   * Source type:
+   * - 'continuous': sinusoidal oscillation (default)
+   * - 'pulse': Gaussian-modulated pulse — a single burst that propagates outward
+   */
+  type?: 'continuous' | 'pulse';
+  /** Width of the Gaussian envelope in seconds (only for 'pulse' type).
+   *  Controls how many cycles are in the burst. Default: 3 periods. */
+  pulseWidth?: number;
 }
 
 export class FDTDSimulation3D {
@@ -244,17 +253,32 @@ export class FDTDSimulation3D {
    *
    * We use a "soft source" — adding to the field rather than overwriting it.
    * This lets waves pass through the source point instead of reflecting off it.
-   * The source is a sinusoidal oscillation: amplitude * sin(2π * frequency * t)
+   *
+   * Two modes:
+   * - 'continuous': amplitude * sin(2π * f * t)  — steady oscillation
+   * - 'pulse': amplitude * exp(-((t-t0)²)/(2σ²)) * sin(2π * f * t) — single burst
+   *    where t0 = 3σ (delayed so the pulse starts near zero) and σ = pulseWidth
    */
   private injectSources(): void {
     for (const source of this.sources) {
-      const value = source.amplitude * Math.sin(
-        2 * Math.PI * source.frequency * this.currentTime
-      );
+      let value: number;
+
+      if (source.type === 'pulse') {
+        // Gaussian pulse: peaks at t0, then decays to zero
+        const sigma = source.pulseWidth ?? (3 / source.frequency); // default: 3 periods wide
+        const t0 = 3 * sigma; // delay so it starts near zero
+        const t = this.currentTime;
+        const envelope = Math.exp(-((t - t0) * (t - t0)) / (2 * sigma * sigma));
+        value = source.amplitude * envelope * Math.sin(2 * Math.PI * source.frequency * t);
+      } else {
+        // Continuous sinusoidal
+        value = source.amplitude * Math.sin(
+          2 * Math.PI * source.frequency * this.currentTime
+        );
+      }
 
       const idx = this.idx(source.ix, source.iy, source.iz);
 
-      // Add to the appropriate field component (soft source)
       switch (source.polarization) {
         case 'x': this.Ex[idx] += value; break;
         case 'y': this.Ey[idx] += value; break;
