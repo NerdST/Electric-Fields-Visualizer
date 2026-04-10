@@ -13,7 +13,9 @@ import type { TwoPointProbeResult } from '../models/TwoPointProbe';
 import { computeLineProbe } from '../models/LineProbe';
 import type { LineProbeResult } from '../models/LineProbe';
 import { FDTDSimulation3D, createDefaultFDTDConfig } from '../simulation/FDTDSimulation3D';
+import { FDTDSimulationGPU } from '../simulation/FDTDSimulationGPU';
 import { FDTDVectorFieldRenderer } from '../views/FDTDVectorField';
+import type { FDTDSimulationReader } from '../views/FDTDVectorField';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -255,22 +257,54 @@ const updateVoltagePointMeshes = (voltagePoints: VoltagePoint[]) => {
 updateChargeMeshes();
 
 // FDTD simulation (module-level so it persists across React re-renders)
+// Starts with CPU version; GPU version replaces it once initialized.
 const fdtdConfig = createDefaultFDTDConfig();
-const fdtdSimulation = new FDTDSimulation3D(fdtdConfig);
-const fdtdVectorField = new FDTDVectorFieldRenderer(scene, fdtdSimulation);
+let fdtdSimulation: FDTDSimulationReader & { step: () => void; reset: () => void; addSource: (s: any) => void; getStepCount: () => number; getCurrentTime: () => number; readback?: () => Promise<void> } = new FDTDSimulation3D(fdtdConfig);
+let fdtdVectorField: FDTDVectorFieldRenderer = new FDTDVectorFieldRenderer(scene, fdtdSimulation);
+let fdtdIsGPU = false;
 
-// Add a default source at grid center — z-polarized oscillating dipole
-fdtdSimulation.addSource({
+const defaultSource = {
   ix: Math.floor(fdtdConfig.nx / 2),
   iy: Math.floor(fdtdConfig.ny / 2),
   iz: Math.floor(fdtdConfig.nz / 2),
-  frequency: 3e9,    // 3 GHz — microwave, ~10cm wavelength (fits in our grid)
+  frequency: 3e8,          // 300 MHz — one full cycle takes ~200 steps (~3 sec at 60fps)
   amplitude: 1.0,
-  polarization: 'z',
-});
+  polarization: 'z' as const,
+  type: 'pulse' as const,
+};
+fdtdSimulation.addSource(defaultSource);
+
+// Try to initialize GPU version (async, replaces CPU when ready)
+async function initGPUSimulation() {
+  try {
+    if (!('gpu' in navigator)) {
+      console.log('FDTD: WebGPU not available, using CPU');
+      return;
+    }
+    const adapter = await (navigator as any).gpu.requestAdapter();
+    if (!adapter) {
+      console.log('FDTD: No WebGPU adapter, using CPU');
+      return;
+    }
+    const device = await adapter.requestDevice();
+    const gpuSim = await FDTDSimulationGPU.create(device, fdtdConfig);
+    gpuSim.addSource(defaultSource);
+
+    // Swap out the CPU simulation
+    fdtdVectorField.dispose();
+    fdtdSimulation = gpuSim;
+    fdtdVectorField = new FDTDVectorFieldRenderer(scene, gpuSim);
+    fdtdIsGPU = true;
+    console.log('FDTD: GPU simulation initialized successfully');
+  } catch (err) {
+    console.warn('FDTD: GPU init failed, using CPU fallback:', err);
+  }
+}
+initGPUSimulation();
 
 let fdtdRunning = false;
-const FDTD_STEPS_PER_FRAME = 5; // Multiple steps per render for faster wave propagation
+let fdtdStepsPerFrame = 1;
+let pendingReadback = false;
 
 function animate() {
   requestAnimationFrame(animate);
@@ -278,10 +312,20 @@ function animate() {
 
   // Advance FDTD simulation if running
   if (fdtdRunning) {
-    for (let i = 0; i < FDTD_STEPS_PER_FRAME; i++) {
+    for (let i = 0; i < fdtdStepsPerFrame; i++) {
       fdtdSimulation.step();
     }
-    fdtdVectorField.update();
+
+    // GPU version needs async readback; CPU version updates arrays directly
+    if (fdtdIsGPU && fdtdSimulation.readback && !pendingReadback) {
+      pendingReadback = true;
+      fdtdSimulation.readback().then(() => {
+        fdtdVectorField.update();
+        pendingReadback = false;
+      });
+    } else if (!fdtdIsGPU) {
+      fdtdVectorField.update();
+    }
   }
 
   renderer.render(scene, camera);
@@ -741,6 +785,7 @@ const ThreeWorkspace: React.FC = () => {
     fdtdVectorField.setVisible(newState);
     if (newState) {
       fdtdSimulation.reset();
+      fdtdVectorField.resetPeak();
     }
   };
 
@@ -901,11 +946,40 @@ const ThreeWorkspace: React.FC = () => {
               fontSize: '10px',
               color: '#aaa',
               marginTop: '4px',
-              padding: '4px',
+              padding: '6px',
               background: 'rgba(255,255,255,0.05)',
               borderRadius: '3px',
             }}>
-              Step: {fdtdSimulation.getStepCount()} | Time: {fdtdSimulation.getCurrentTime().toExponential(2)}s
+              <div>Step: {fdtdSimulation.getStepCount()} | Time: {fdtdSimulation.getCurrentTime().toExponential(2)}s</div>
+              <div style={{ marginTop: '4px' }}>
+                <label>Speed: </label>
+                <input
+                  type="range"
+                  min="1"
+                  max="20"
+                  defaultValue="1"
+                  onChange={(e) => { fdtdStepsPerFrame = parseInt(e.target.value); }}
+                  style={{ width: '100px', verticalAlign: 'middle' }}
+                />
+              </div>
+              <button
+                onClick={() => {
+                  fdtdSimulation.reset();
+                  fdtdVectorField.resetPeak();
+                }}
+                style={{
+                  marginTop: '4px',
+                  padding: '4px 8px',
+                  background: '#ff9800',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '3px',
+                  cursor: 'pointer',
+                  fontSize: '10px',
+                }}
+              >
+                Reset Simulation
+              </button>
             </div>
           )}
         </div>
