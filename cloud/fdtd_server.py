@@ -22,13 +22,14 @@ Run locally:
 
 import asyncio
 import json
+import threading
 import time
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from fdtd_engine import FDTDEngine
+from fdtd_engine import FDTDEngine, _USING_GPU
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -43,33 +44,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Single shared thread pool for FDTD compute (CPU-bound work off the event loop)
+_executor = ThreadPoolExecutor(max_workers=1)
 
 # ---------------------------------------------------------------------------
 # Session state (one engine per connected client)
 # ---------------------------------------------------------------------------
 
+# 256×256 is 4× faster than 512×512 and still looks great.
+# Bump to 512 if running on a GPU (CuPy).
+_GRID_SIZE = 512 if _USING_GPU else 256
+# 30 steps/sec is smooth on CPU; GPU can handle much more.
+_DEFAULT_SPS = 120 if _USING_GPU else 30
+
 class SimSession:
     def __init__(self):
-        self.engine = FDTDEngine(size=512, cell_size=0.01)
+        self.engine = FDTDEngine(size=_GRID_SIZE, cell_size=0.01)
+        self._lock = threading.Lock()
         self.paused = False
-        self.target_sps: int = 240
+        self.target_sps: int = _DEFAULT_SPS
         self._steps_this_window: int = 0
         self._window_start: float = time.monotonic()
         self._measured_sps: float = 0.0
         self._total_steps: int = 0
 
-    def tick(self, elapsed_s: float) -> int:
-        """Run as many steps as needed to keep up with target_sps. Returns steps executed."""
+    def tick_sync(self, elapsed_s: float) -> int:
+        """Blocking FDTD step — called from the thread executor."""
         if self.paused:
             return 0
         target_dt = 1.0 / max(1, self.target_sps)
         steps_to_run = max(0, int(elapsed_s / target_dt))
-        steps_to_run = min(steps_to_run, self.target_sps)  # cap per tick
+        steps_to_run = min(steps_to_run, self.target_sps)
         if steps_to_run > 0:
-            self.engine.step(steps_to_run)
+            with self._lock:
+                self.engine.step(steps_to_run)
             self._steps_this_window += steps_to_run
             self._total_steps += steps_to_run
         return steps_to_run
+
+    def sample_sync(self, positions: list) -> list:
+        """Blocking sample — called from the thread executor."""
+        with self._lock:
+            return self.engine.sample_at(positions)
+
+    def set_charges_sync(self, charges: list) -> None:
+        with self._lock:
+            self.engine.set_charges(charges)
 
     def update_rate(self) -> float:
         now = time.monotonic()
@@ -89,61 +109,68 @@ class SimSession:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     session = SimSession()
-    last_tick = time.monotonic()
-    last_stats = time.monotonic()
+    loop = asyncio.get_event_loop()
 
-    try:
+    async def run_in_thread(fn, *args):
+        return await loop.run_in_executor(_executor, fn, *args)
+
+    # Background sim loop — runs FDTD in thread, never blocks WebSocket messages
+    async def sim_loop():
+        last_tick = time.monotonic()
+        last_stats = time.monotonic()
         while True:
-            # Process incoming messages (non-blocking, short timeout)
-            try:
-                raw = await asyncio.wait_for(ws.receive_text(), timeout=0.005)
-                msg = json.loads(raw)
-                await _handle_message(msg, session, ws)
-            except asyncio.TimeoutError:
-                pass
-
-            # Run simulation steps
+            await asyncio.sleep(0.016)  # ~60Hz tick rate
             now = time.monotonic()
             elapsed = now - last_tick
             last_tick = now
-            session.tick(elapsed)
 
-            # Periodic stats push (~10Hz)
+            await run_in_thread(session.tick_sync, elapsed)
+
             if now - last_stats >= 0.1:
                 last_stats = now
                 sps = session.update_rate()
                 stats = session.engine.get_stats()
-                await ws.send_text(json.dumps({
-                    "type": "stats",
-                    "stepsPerSecond": round(sps, 1),
-                    "totalSteps": session._total_steps,
-                    "time": stats["time"],
-                    "dt": stats["dt"],
-                    "usingGpu": stats["usingGpu"],
-                    "paused": session.paused,
-                    "targetSps": session.target_sps,
-                }))
+                try:
+                    await ws.send_text(json.dumps({
+                        "type": "stats",
+                        "stepsPerSecond": round(sps, 1),
+                        "totalSteps": session._total_steps,
+                        "time": stats["time"],
+                        "dt": stats["dt"],
+                        "usingGpu": stats["usingGpu"],
+                        "paused": session.paused,
+                        "targetSps": session.target_sps,
+                        "gridSize": stats["size"],
+                    }))
+                except Exception:
+                    break
+
+    sim_task = asyncio.create_task(sim_loop())
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            await _handle_message(msg, session, ws, run_in_thread)
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
         print(f"Session error: {e}")
-        try:
-            await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
-        except Exception:
-            pass
+    finally:
+        sim_task.cancel()
 
 
-async def _handle_message(msg: dict, session: SimSession, ws: WebSocket):
+async def _handle_message(msg: dict, session: SimSession, ws: WebSocket, run_in_thread):
     t = msg.get("type")
 
     if t == "set_charges":
-        session.engine.set_charges(msg.get("charges", []))
+        await run_in_thread(session.set_charges_sync, msg.get("charges", []))
 
     elif t == "sample":
         request_id = msg.get("requestId", 0)
         positions = msg.get("positions", [])
-        fields = session.engine.sample_at(positions)
+        fields = await run_in_thread(session.sample_sync, positions)
         await ws.send_text(json.dumps({
             "type": "field_sample",
             "requestId": request_id,
@@ -154,7 +181,7 @@ async def _handle_message(msg: dict, session: SimSession, ws: WebSocket):
         session.paused = bool(msg.get("paused", False))
 
     elif t == "set_steps_per_second":
-        session.target_sps = max(1, min(2000, int(msg.get("value", 240))))
+        session.target_sps = max(1, min(2000, int(msg.get("value", _DEFAULT_SPS))))
 
     elif t == "ping":
         await ws.send_text(json.dumps({"type": "pong"}))
@@ -166,4 +193,4 @@ async def _handle_message(msg: dict, session: SimSession, ws: WebSocket):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "gridSize": _GRID_SIZE, "usingGpu": _USING_GPU, "defaultSps": _DEFAULT_SPS}

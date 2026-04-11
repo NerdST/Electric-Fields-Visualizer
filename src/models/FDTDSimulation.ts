@@ -340,7 +340,7 @@ export class FDTDSimulation {
     });
 
     this.runComputePass('updateAlphaBeta', bindGroup,
-      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+      Math.ceil(this.textureSize / 16), Math.ceil(this.textureSize / 16));
   }
 
   createTexture2D(name: string, width: number, height: number, format: GPUTextureFormat = 'rgba16float') {
@@ -421,7 +421,7 @@ export class FDTDSimulation {
     });
 
     this.runComputePass('drawEllipse', bindGroup,
-      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+      Math.ceil(this.textureSize / 16), Math.ceil(this.textureSize / 16));
 
     // Copy result back to source field
     this.copyTexture(tempTexture, this.textures.get('sourceField')!);
@@ -503,7 +503,7 @@ export class FDTDSimulation {
       });
 
       this.runComputePass('updateAlphaBeta', bindGroup,
-        Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+        Math.ceil(this.textureSize / 16), Math.ceil(this.textureSize / 16));
 
       simBuffer.destroy();
     }
@@ -536,7 +536,7 @@ export class FDTDSimulation {
     });
 
     this.runComputePass('updateElectric', bindGroup,
-      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+      Math.ceil(this.textureSize / 16), Math.ceil(this.textureSize / 16));
 
     paramsBuffer.destroy();
   }
@@ -568,7 +568,7 @@ export class FDTDSimulation {
     });
 
     this.runComputePass('updateMagnetic', bindGroup,
-      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+      Math.ceil(this.textureSize / 16), Math.ceil(this.textureSize / 16));
 
     paramsBuffer.destroy();
   }
@@ -601,7 +601,7 @@ export class FDTDSimulation {
     });
 
     this.runComputePass('injectSource', bindGroup,
-      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+      Math.ceil(this.textureSize / 16), Math.ceil(this.textureSize / 16));
 
     // Copy result back to current electric field
     this.copyTexture(this.tempTexture!, this.textures.get('electricField')!);
@@ -625,7 +625,7 @@ export class FDTDSimulation {
     });
 
     this.runComputePass('decaySource', bindGroup,
-      Math.ceil(this.textureSize / 8), Math.ceil(this.textureSize / 8));
+      Math.ceil(this.textureSize / 16), Math.ceil(this.textureSize / 16));
 
     // Copy result back to current source field
     this.copyTexture(this.tempTexture!, this.textures.get('sourceField')!);

@@ -2,7 +2,7 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
-import { createDefaultCharge, createCharge } from '../models/Charge';
+import { createDefaultCharge, createCharge, electricFieldAt } from '../models/Charge';
 import type { Charge } from '../models/Charge';
 import {
   createDefaultSource,
@@ -289,7 +289,7 @@ const ThreeWorkspace: React.FC = () => {
       sampleCacheSize: 0,
     },
   );
-  const [fdtdPaused, setFdtdPaused] = useState(false);
+  const [fdtdPaused, setFdtdPaused] = useState(true);
   const [fdtdTargetSps, setFdtdTargetSps] = useState(240);
   const simulationProviderRef = useRef<SimulationProvider>(
     createSimulationProvider('analytical'),
@@ -304,7 +304,7 @@ const ThreeWorkspace: React.FC = () => {
   }, []);
 
   const [simulationTimeSeconds, setSimulationTimeSeconds] = useState(0);
-  const [simulationClockRunning, setSimulationClockRunning] = useState(true);
+  const [simulationClockRunning, setSimulationClockRunning] = useState(false);
   const [simulationTimeScale, setSimulationTimeScale] = useState(1);
   const [sourceDefs, setSourceDefs] = useState<SimulationSource[]>([source1]);
   const simulationClockRef = useRef<number | null>(null);
@@ -333,6 +333,11 @@ const ThreeWorkspace: React.FC = () => {
     useState<FieldLineRenderer | null>(null);
   const [showFieldLines, setShowFieldLines] = useState(false);
 
+  // Refs that always point to the latest renderer instances — used for stable access
+  // in event handlers and intervals without stale closure issues.
+  const vectorFieldRendererRef = useRef<VectorFieldRenderer | null>(null);
+  const fieldLineRendererRef = useRef<FieldLineRenderer | null>(null);
+
   // Charge state mirrors global `charges`
   const [chargesState, setChargesState] = useState<Charge[]>(charges);
   const chargesRef = useRef<Charge[]>(chargesState);
@@ -340,6 +345,42 @@ const ThreeWorkspace: React.FC = () => {
     chargesRef.current = chargesState;
     simulationProviderRef.current.setCharges(chargesState);
   }, [chargesState]);
+
+  // Vector field renderer — owned by this effect (safe under React 18 StrictMode double-invoke)
+  useEffect(() => {
+    const vectorFieldConfig = createDefaultVectorFieldConfig();
+    vectorFieldConfig.fieldSampler = (position, _c) => sampleFieldAtPosition(position);
+    const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
+    vfRenderer.updateCharges(charges);
+    vectorFieldRendererRef.current = vfRenderer;
+    setVectorFieldRenderer(vfRenderer);
+    return () => {
+      vfRenderer.dispose();
+      vectorFieldRendererRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Field line renderer — owned by this effect (safe under React 18 StrictMode double-invoke).
+  // 1 Hz refresh interval is co-located here so it's always tied to the live renderer instance.
+  useEffect(() => {
+    const fieldLineConfig = createDefaultFieldLineConfig();
+    fieldLineConfig.fieldSampler = (position, c) => electricFieldAt(position, c);
+    const flRenderer = new FieldLineRenderer(scene, fieldLineConfig);
+    flRenderer.updateCharges(chargesRef.current);
+    flRenderer.setVisible(false);
+    fieldLineRendererRef.current = flRenderer;
+    setFieldLineRenderer(flRenderer);
+    const id = window.setInterval(() => {
+      flRenderer.updateCharges(chargesRef.current);
+    }, 1000);
+    return () => {
+      window.clearInterval(id);
+      flRenderer.dispose();
+      fieldLineRendererRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const evaluatedCharges = evaluateSourcesToCharges(sourceDefs, simulationTimeSeconds);
@@ -349,10 +390,7 @@ const ThreeWorkspace: React.FC = () => {
     if (vectorFieldRenderer) {
       vectorFieldRenderer.updateCharges(evaluatedCharges);
     }
-    if (fieldLineRenderer) {
-      fieldLineRenderer.updateCharges(evaluatedCharges);
-    }
-  }, [fieldLineRenderer, simulationTimeSeconds, sourceDefs, vectorFieldRenderer]);
+  }, [simulationTimeSeconds, sourceDefs, vectorFieldRenderer]);
 
   useEffect(() => {
     if (!simulationClockRunning) {
@@ -438,8 +476,6 @@ const ThreeWorkspace: React.FC = () => {
   const [hoverVoltage, setHoverVoltage] = useState<number | null>(null);
   const [hoverPosition, setHoverPosition] = useState<THREE.Vector3 | null>(null);
 
-  const vectorFieldInitialized = useRef(false);
-  const fieldLineInitialized = useRef(false);
   // Charge management
   const addCharge = useCallback(() => {
     const newCharge = createCharge(
@@ -485,14 +521,17 @@ const ThreeWorkspace: React.FC = () => {
 
   const selectCharge = useCallback(
     (chargeId: string) => {
-      const charge = chargesState.find((c) => c.id === chargeId);
+      // Use chargesRef (always current) instead of chargesState so this callback
+      // is stable and doesn't change every frame, which would re-run the setup
+      // useEffect and dispose the field line renderer.
+      const charge = chargesRef.current.find((c) => c.id === chargeId);
       if (charge) {
         setSelectedCharge(charge);
         selectedChargeId = chargeId;
         updateChargeMeshes();
       }
     },
-    [chargesState],
+    [],
   );
 
   const updateChargeMagnitude = useCallback(
@@ -602,25 +641,6 @@ const ThreeWorkspace: React.FC = () => {
     controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
 
-    if (!vectorFieldInitialized.current) {
-      const vectorFieldConfig = createDefaultVectorFieldConfig();
-      vectorFieldConfig.fieldSampler = (position, _charges) => sampleFieldAtPosition(position);
-      const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
-      vfRenderer.updateCharges(charges);
-      setVectorFieldRenderer(vfRenderer);
-      vectorFieldInitialized.current = true;
-    }
-
-    if (!fieldLineInitialized.current) {
-      const fieldLineConfig = createDefaultFieldLineConfig();
-      fieldLineConfig.fieldSampler = (position, _charges) => sampleFieldAtPosition(position);
-      const flRenderer = new FieldLineRenderer(scene, fieldLineConfig);
-      flRenderer.updateCharges(charges);
-      flRenderer.setVisible(showFieldLines);
-      setFieldLineRenderer(flRenderer);
-      fieldLineInitialized.current = true;
-    }
-
     const onResize = () => {
       const width = container.clientWidth || window.innerWidth;
       const height = container.clientHeight || window.innerHeight;
@@ -668,14 +688,8 @@ const ThreeWorkspace: React.FC = () => {
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
-      if (vectorFieldRenderer) {
-        vectorFieldRenderer.dispose();
-      }
-      if (fieldLineRenderer) {
-        fieldLineRenderer.dispose();
-      }
     };
-  }, [handleMouseClick, sampleFieldAtPosition, samplePotentialAtPosition, vectorFieldRenderer]);
+  }, [handleMouseClick, sampleFieldAtPosition, samplePotentialAtPosition]);
 
   // Keep voltage point meshes in sync with state
   useEffect(() => {

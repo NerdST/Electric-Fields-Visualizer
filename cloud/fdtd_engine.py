@@ -166,39 +166,48 @@ class FDTDEngine:
 
     def sample_at(self, positions: list[tuple]) -> list[list[float]]:
         """
-        Sample E field at a list of (nx, ny, nz) positions (all in [0,1]).
-        Returns list of [Ex, Ey, Ez, |E|] per position.
-        Uses bilinear interpolation.
+        Vectorised bilinear sample of E field at N positions (nx, ny, nz) in [0,1].
+        Returns [[Ex, Ey, Ez, |E|], ...].
         """
-        results = []
-        for pos in positions:
-            nx, ny = float(pos[0]), float(pos[1])
-            px = max(0.0, min(float(self.size - 1), nx * self.size))
-            py = max(0.0, min(float(self.size - 1), ny * self.size))
+        if not positions:
+            return []
 
-            # Bilinear interpolation
-            x0, y0 = int(px), int(py)
-            x1 = min(x0 + 1, self.size - 1)
-            y1 = min(y0 + 1, self.size - 1)
-            tx = px - x0
-            ty = py - y0
+        import numpy as _np  # always plain numpy for index arrays
 
-            def _bilerp(field):
-                v00 = float(field[x0, y0])
-                v10 = float(field[x1, y0])
-                v01 = float(field[x0, y1])
-                v11 = float(field[x1, y1])
-                return (v00 * (1 - tx) * (1 - ty) +
-                        v10 * tx * (1 - ty) +
-                        v01 * (1 - tx) * ty +
-                        v11 * tx * ty)
+        n = len(positions)
+        nxs = _np.array([p[0] for p in positions], dtype=_np.float32)
+        nys = _np.array([p[1] for p in positions], dtype=_np.float32)
 
-            ex = _bilerp(self.Ex)
-            ey = _bilerp(self.Ey)
-            ez = _bilerp(self.Ez)
-            mag = math.sqrt(ex*ex + ey*ey + ez*ez)
-            results.append([ex, ey, ez, mag])
-        return results
+        s = self.size
+        px = _np.clip(nxs * s, 0.0, s - 1.0001)
+        py = _np.clip(nys * s, 0.0, s - 1.0001)
+
+        x0 = px.astype(_np.int32)
+        y0 = py.astype(_np.int32)
+        x1 = _np.minimum(x0 + 1, s - 1)
+        y1 = _np.minimum(y0 + 1, s - 1)
+        tx = (px - x0).astype(_np.float32)
+        ty = (py - y0).astype(_np.float32)
+        wx0y0 = (1 - tx) * (1 - ty)
+        wx1y0 = tx * (1 - ty)
+        wx0y1 = (1 - tx) * ty
+        wx1y1 = tx * ty
+
+        def _bilerp(field):
+            # field is a (size, size) array (numpy or cupy)
+            v = (field[x0, y0] * wx0y0 +
+                 field[x1, y0] * wx1y0 +
+                 field[x0, y1] * wx0y1 +
+                 field[x1, y1] * wx1y1)
+            # bring back to CPU if cupy
+            return v.get() if hasattr(v, 'get') else _np.asarray(v)
+
+        ex = _bilerp(self.Ex)
+        ey = _bilerp(self.Ey)
+        ez = _bilerp(self.Ez)
+        mag = _np.sqrt(ex*ex + ey*ey + ez*ez)
+
+        return [[float(ex[i]), float(ey[i]), float(ez[i]), float(mag[i])] for i in range(n)]
 
     def get_stats(self) -> dict:
         return {
