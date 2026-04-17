@@ -323,32 +323,9 @@ function syncChargesToFDTD(currentCharges: Charge[]) {
   console.log(`FDTD: ${fdtdSourceChargeIds.size} sources active out of ${currentCharges.length} charges`);
 }
 
-// Try to initialize GPU version (async, replaces CPU when ready)
-async function initGPUSimulation() {
-  try {
-    if (!('gpu' in navigator)) {
-      console.log('FDTD: WebGPU not available, using CPU');
-      return;
-    }
-    const adapter = await (navigator as any).gpu.requestAdapter();
-    if (!adapter) {
-      console.log('FDTD: No WebGPU adapter, using CPU');
-      return;
-    }
-    const device = await adapter.requestDevice();
-    const gpuSim = await FDTDSimulationGPU.create(device, fdtdConfig);
-
-    // Swap out the CPU simulation
-    fdtdHeatmap.dispose();
-    fdtdSimulation = gpuSim;
-    fdtdHeatmap = new FDTDHeatmapRenderer(scene, gpuSim);
-    fdtdIsGPU = true;
-    console.log('FDTD: GPU simulation initialized successfully');
-  } catch (err) {
-    console.warn('FDTD: GPU init failed, using CPU fallback:', err);
-  }
-}
-initGPUSimulation();
+// GPU disabled for now — using CPU to debug visualization
+// TODO: re-enable GPU once heatmap is confirmed working
+console.log('FDTD: using CPU simulation');
 
 let fdtdRunning = false;
 let fdtdStepsPerFrame = 5;
@@ -866,10 +843,26 @@ const ThreeWorkspace: React.FC = () => {
     if (newState) {
       if (vectorFieldRenderer) vectorFieldRenderer.setVisible(false);
       setShowVectorField(false);
-      // Sync current charges as FDTD sources and reset
-      syncChargesToFDTD(chargesRef.current);
+
+      // Reset and inject sources
       fdtdSimulation.reset();
       fdtdHeatmap.resetPeak();
+      fdtdSimulation.clearSources();
+
+      // Sync charges, then always add a test source at grid center too
+      syncChargesToFDTD(chargesRef.current);
+
+      const cx = Math.floor(fdtdConfig.nx / 2);
+      const cy = Math.floor(fdtdConfig.ny / 2);
+      const cz = Math.floor(fdtdConfig.nz / 2);
+      fdtdSimulation.addSource({
+        ix: cx, iy: cy, iz: cz,
+        frequency: 3e8,
+        amplitude: 1.0,
+        polarization: 'z' as const,
+        type: 'pulse' as const,
+      });
+      console.log(`FDTD: started with test source at grid center (${cx}, ${cy}, ${cz})`);
     } else {
       // Restore Coulomb vector field when FDTD stops
       if (vectorFieldRenderer) vectorFieldRenderer.setVisible(true);

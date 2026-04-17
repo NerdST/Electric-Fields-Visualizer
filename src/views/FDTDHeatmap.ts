@@ -53,11 +53,11 @@ export class FDTDHeatmapRenderer {
 
     this.geometry = new THREE.BufferGeometry();
     this.material = new THREE.PointsMaterial({
-      size: worldScale * stride * 0.9,  // fill most of each cell
+      size: 8,  // size in pixels (sizeAttenuation off)
       vertexColors: true,
       transparent: true,
       opacity: 0.9,
-      sizeAttenuation: true,
+      sizeAttenuation: false,  // fixed pixel size regardless of camera distance
       depthWrite: false,
     });
 
@@ -85,7 +85,6 @@ export class FDTDHeatmapRenderer {
     // Static positions — these don't change
     const positions = new Float32Array(count * 3);
     const colors = new Float32Array(count * 3);  // RGB per vertex
-    const sizes = new Float32Array(count);        // per-point size
 
     for (let n = 0; n < count; n++) {
       const { i, j, k } = this.visibleCells[n];
@@ -93,18 +92,20 @@ export class FDTDHeatmapRenderer {
       positions[n * 3 + 1] = this.originOffset.y + j * this.worldScale;
       positions[n * 3 + 2] = this.originOffset.z + k * this.worldScale;
 
-      // Start invisible
+      // Start black (invisible on dark background)
       colors[n * 3] = 0;
       colors[n * 3 + 1] = 0;
       colors[n * 3 + 2] = 0;
-      sizes[n] = 0;
     }
 
     this.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    this.geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+    // Must compute bounding sphere or Three.js frustum-culls the entire point cloud
+    this.geometry.computeBoundingSphere();
 
     this.points = new THREE.Points(this.geometry, this.material);
+    this.points.frustumCulled = false;  // extra safety — never cull this
     this.points.visible = false;  // hidden until user enables
     this.scene.add(this.points);
   }
