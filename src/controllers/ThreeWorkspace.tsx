@@ -16,6 +16,7 @@ import { FDTDSimulation3D, createDefaultFDTDConfig } from '../simulation/FDTDSim
 import { FDTDSimulationGPU } from '../simulation/FDTDSimulationGPU';
 import { FDTDVectorFieldRenderer } from '../views/FDTDVectorField';
 import type { FDTDSimulationReader } from '../views/FDTDVectorField';
+import { FDTDHeatmapRenderer } from '../views/FDTDHeatmap';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -259,20 +260,68 @@ updateChargeMeshes();
 // FDTD simulation (module-level so it persists across React re-renders)
 // Starts with CPU version; GPU version replaces it once initialized.
 const fdtdConfig = createDefaultFDTDConfig();
-let fdtdSimulation: FDTDSimulationReader & { step: () => void; reset: () => void; addSource: (s: any) => void; getStepCount: () => number; getCurrentTime: () => number; readback?: () => Promise<void> } = new FDTDSimulation3D(fdtdConfig);
-let fdtdVectorField: FDTDVectorFieldRenderer = new FDTDVectorFieldRenderer(scene, fdtdSimulation);
+type FDTDSim = FDTDSimulationReader & {
+  step: () => void;
+  reset: () => void;
+  addSource: (s: any) => void;
+  clearSources: () => void;
+  getStepCount: () => number;
+  getCurrentTime: () => number;
+  readback?: () => Promise<void>;
+};
+let fdtdSimulation: FDTDSim = new FDTDSimulation3D(fdtdConfig);
+let fdtdHeatmap: FDTDHeatmapRenderer = new FDTDHeatmapRenderer(scene, fdtdSimulation);
 let fdtdIsGPU = false;
 
-const defaultSource = {
-  ix: Math.floor(fdtdConfig.nx / 2),
-  iy: Math.floor(fdtdConfig.ny / 2),
-  iz: Math.floor(fdtdConfig.nz / 2),
-  frequency: 3e8,          // 300 MHz — one full cycle takes ~200 steps (~3 sec at 60fps)
-  amplitude: 1.0,
-  polarization: 'z' as const,
-  type: 'pulse' as const,
-};
-fdtdSimulation.addSource(defaultSource);
+// Track which charges have been injected as FDTD sources
+let fdtdSourceChargeIds: Set<string> = new Set();
+
+/** Convert a world-space position to FDTD grid indices */
+function worldToGrid(pos: THREE.Vector3): { ix: number; iy: number; iz: number } | null {
+  const ws = 0.3; // worldScale used by heatmap
+  const ox = -(fdtdConfig.nx * ws) / 2;
+  const oy = -(fdtdConfig.ny * ws) / 2;
+  const oz = -(fdtdConfig.nz * ws) / 2;
+
+  const ix = Math.round((pos.x - ox) / ws);
+  const iy = Math.round((pos.y - oy) / ws);
+  const iz = Math.round((pos.z - oz) / ws);
+
+  // Clamp to interior (avoid boundary cells)
+  if (ix < 2 || ix >= fdtdConfig.nx - 2) return null;
+  if (iy < 2 || iy >= fdtdConfig.ny - 2) return null;
+  if (iz < 2 || iz >= fdtdConfig.nz - 2) return null;
+
+  return { ix, iy, iz };
+}
+
+/** Sync all current charges as FDTD pulse sources */
+function syncChargesToFDTD(currentCharges: Charge[]) {
+  fdtdSimulation.clearSources();
+  fdtdSourceChargeIds.clear();
+
+  for (const charge of currentCharges) {
+    const grid = worldToGrid(charge.position);
+    if (!grid) {
+      console.warn(`FDTD: charge ${charge.id} at (${charge.position.x.toFixed(1)}, ${charge.position.y.toFixed(1)}, ${charge.position.z.toFixed(1)}) is outside the grid — skipped`);
+      continue;
+    }
+
+    fdtdSimulation.addSource({
+      ix: grid.ix,
+      iy: grid.iy,
+      iz: grid.iz,
+      frequency: 3e8,          // 300 MHz
+      amplitude: charge.magnitude > 0 ? 1.0 : -1.0,
+      polarization: 'z' as const,
+      type: 'pulse' as const,
+    });
+    fdtdSourceChargeIds.add(charge.id);
+    console.log(`FDTD: added source for charge ${charge.id} at grid (${grid.ix}, ${grid.iy}, ${grid.iz})`);
+  }
+
+  console.log(`FDTD: ${fdtdSourceChargeIds.size} sources active out of ${currentCharges.length} charges`);
+}
 
 // Try to initialize GPU version (async, replaces CPU when ready)
 async function initGPUSimulation() {
@@ -288,12 +337,11 @@ async function initGPUSimulation() {
     }
     const device = await adapter.requestDevice();
     const gpuSim = await FDTDSimulationGPU.create(device, fdtdConfig);
-    gpuSim.addSource(defaultSource);
 
     // Swap out the CPU simulation
-    fdtdVectorField.dispose();
+    fdtdHeatmap.dispose();
     fdtdSimulation = gpuSim;
-    fdtdVectorField = new FDTDVectorFieldRenderer(scene, gpuSim);
+    fdtdHeatmap = new FDTDHeatmapRenderer(scene, gpuSim);
     fdtdIsGPU = true;
     console.log('FDTD: GPU simulation initialized successfully');
   } catch (err) {
@@ -303,7 +351,7 @@ async function initGPUSimulation() {
 initGPUSimulation();
 
 let fdtdRunning = false;
-let fdtdStepsPerFrame = 1;
+let fdtdStepsPerFrame = 5;
 let pendingReadback = false;
 
 function animate() {
@@ -316,15 +364,26 @@ function animate() {
       fdtdSimulation.step();
     }
 
+    // Debug: log field magnitude every 60 frames
+    const step = fdtdSimulation.getStepCount();
+    if (step % 60 === 0 && step > 0) {
+      const cx = Math.floor(fdtdConfig.nx / 2);
+      const cy = Math.floor(fdtdConfig.ny / 2);
+      const cz = Math.floor(fdtdConfig.nz / 2);
+      const centerMag = fdtdSimulation.getFieldMagnitudeAt(cx, cy, cz);
+      const nearMag = fdtdSimulation.getFieldMagnitudeAt(cx + 3, cy, cz);
+      console.log(`FDTD step ${step}: center mag=${centerMag.toExponential(2)}, nearby=${nearMag.toExponential(2)}, GPU=${fdtdIsGPU}, heatmap visible=${fdtdHeatmap.isVisible()}`);
+    }
+
     // GPU version needs async readback; CPU version updates arrays directly
     if (fdtdIsGPU && fdtdSimulation.readback && !pendingReadback) {
       pendingReadback = true;
       fdtdSimulation.readback().then(() => {
-        fdtdVectorField.update();
+        fdtdHeatmap.update();
         pendingReadback = false;
       });
     } else if (!fdtdIsGPU) {
-      fdtdVectorField.update();
+      fdtdHeatmap.update();
     }
   }
 
@@ -500,6 +559,13 @@ const ThreeWorkspace: React.FC = () => {
     setChargeStack((prev) => [...prev, newCharge.id]);
     updateChargeMeshes();
     scheduleVectorFieldUpdate(newCharges);
+
+    // If FDTD is running, re-sync sources and restart
+    if (fdtdRunning) {
+      syncChargesToFDTD(newCharges);
+      fdtdSimulation.reset();
+      fdtdHeatmap.resetPeak();
+    }
   }, [chargesState, scheduleVectorFieldUpdate]);
 
   const removeCharge = useCallback(
@@ -514,6 +580,12 @@ const ThreeWorkspace: React.FC = () => {
 
       updateChargeMeshes();
       scheduleVectorFieldUpdate(newCharges);
+
+      if (fdtdRunning) {
+        syncChargesToFDTD(newCharges);
+        fdtdSimulation.reset();
+        fdtdHeatmap.resetPeak();
+      }
     },
     [chargesState, scheduleVectorFieldUpdate],
   );
@@ -533,6 +605,12 @@ const ThreeWorkspace: React.FC = () => {
     selectedChargeId = null;
     updateChargeMeshes();
     scheduleVectorFieldUpdate([]);
+
+    if (fdtdRunning) {
+      syncChargesToFDTD([]);
+      fdtdSimulation.reset();
+      fdtdHeatmap.resetPeak();
+    }
   }, [scheduleVectorFieldUpdate]);
 
   const selectCharge = useCallback(
@@ -782,10 +860,20 @@ const ThreeWorkspace: React.FC = () => {
     const newState = !fdtdActive;
     setFdtdActive(newState);
     fdtdRunning = newState;
-    fdtdVectorField.setVisible(newState);
+    fdtdHeatmap.setVisible(newState);
+
+    // Auto-hide Coulomb vector field when FDTD is active
     if (newState) {
+      if (vectorFieldRenderer) vectorFieldRenderer.setVisible(false);
+      setShowVectorField(false);
+      // Sync current charges as FDTD sources and reset
+      syncChargesToFDTD(chargesRef.current);
       fdtdSimulation.reset();
-      fdtdVectorField.resetPeak();
+      fdtdHeatmap.resetPeak();
+    } else {
+      // Restore Coulomb vector field when FDTD stops
+      if (vectorFieldRenderer) vectorFieldRenderer.setVisible(true);
+      setShowVectorField(true);
     }
   };
 
@@ -957,15 +1045,16 @@ const ThreeWorkspace: React.FC = () => {
                   type="range"
                   min="1"
                   max="20"
-                  defaultValue="1"
+                  defaultValue="5"
                   onChange={(e) => { fdtdStepsPerFrame = parseInt(e.target.value); }}
                   style={{ width: '100px', verticalAlign: 'middle' }}
                 />
               </div>
               <button
                 onClick={() => {
+                  syncChargesToFDTD(chargesRef.current);
                   fdtdSimulation.reset();
-                  fdtdVectorField.resetPeak();
+                  fdtdHeatmap.resetPeak();
                 }}
                 style={{
                   marginTop: '4px',
