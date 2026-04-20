@@ -67,15 +67,21 @@ class SimSession:
         self._window_start: float = time.monotonic()
         self._measured_sps: float = 0.0
         self._total_steps: int = 0
+        # Accumulates fractional elapsed time so sub-tick fractions aren't lost.
+        # Without this, int(0.016s / (1/30s)) = 0 every tick → simulation never advances.
+        self._accumulator: float = 0.0
 
     def tick_sync(self, elapsed_s: float) -> int:
         """Blocking FDTD step — called from the thread executor."""
         if self.paused:
             return 0
+        self._accumulator += elapsed_s
         target_dt = 1.0 / max(1, self.target_sps)
-        steps_to_run = max(0, int(elapsed_s / target_dt))
+        steps_to_run = int(self._accumulator / target_dt)
+        # Cap to 1 second of steps to prevent runaway bursts after lag or SPS changes.
         steps_to_run = min(steps_to_run, self.target_sps)
         if steps_to_run > 0:
+            self._accumulator -= steps_to_run * target_dt
             with self._lock:
                 self.engine.step(steps_to_run)
             self._steps_this_window += steps_to_run

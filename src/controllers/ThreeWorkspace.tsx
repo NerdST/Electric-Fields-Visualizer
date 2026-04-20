@@ -51,6 +51,9 @@ const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
 const chargeGeometry = new THREE.SphereGeometry(0.2, 16, 16);
 const positiveChargeMaterial = new THREE.MeshStandardMaterial({ color: 0xff4444 });
 const negativeChargeMaterial = new THREE.MeshStandardMaterial({ color: 0x4444ff });
+// Shared outline — created once and reused on the selected charge mesh each frame.
+const outlineGeometry = new THREE.SphereGeometry(0.25, 16, 16);
+const outlineMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00, wireframe: true, transparent: true, opacity: 0.8 });
 
 // Add some default charges
 const charge1 = createDefaultCharge('charge-1');
@@ -107,22 +110,18 @@ const updateChargeMeshes = () => {
     }
     mesh.position.copy(charge.position);
 
-    // Selection highlight
-    mesh.scale.setScalar(selectedChargeId === charge.id ? 1.5 : 1.0);
-    mesh.children
-      .filter((c) => (c as any).isMesh)
-      .forEach((child) => mesh && mesh.remove(child));
-    if (selectedChargeId === charge.id) {
-      const outlineGeometry = new THREE.SphereGeometry(0.25, 16, 16);
-      const outlineMaterial = new THREE.MeshBasicMaterial({
-        color: 0xffff00,
-        wireframe: true,
-        transparent: true,
-        opacity: 0.8,
-      });
-      const outline = new THREE.Mesh(outlineGeometry, outlineMaterial);
-      mesh.add(outline);
+    // Selection highlight — only mutate the child outline when selection state changes.
+    const isSelected = selectedChargeId === charge.id;
+    if (mesh.userData.outlined !== isSelected) {
+      mesh.children
+        .filter((c) => (c as any).isMesh)
+        .forEach((child) => mesh && mesh.remove(child));
+      if (isSelected) {
+        mesh.add(new THREE.Mesh(outlineGeometry, outlineMaterial));
+      }
+      mesh.userData.outlined = isSelected;
     }
+    mesh.scale.setScalar(isSelected ? 1.5 : 1.0);
   }
 
   for (const [id, mesh] of Array.from(chargeMeshes.entries())) {
@@ -382,15 +381,31 @@ const ThreeWorkspace: React.FC = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const prevEvaluatedRef = useRef<Charge[]>([]);
+
   useEffect(() => {
     const evaluatedCharges = evaluateSourcesToCharges(sourceDefs, simulationTimeSeconds);
+
+    // Only push updates downstream when charge values actually differ.
+    // For DC sources this skips redundant React re-renders and vector field resampling
+    // every animation frame even though nothing changed.
+    const prev = prevEvaluatedRef.current;
+    const changed =
+      evaluatedCharges.length !== prev.length ||
+      evaluatedCharges.some((c, i) => {
+        const p = prev[i];
+        return c.magnitude !== p.magnitude || !c.position.equals(p.position);
+      });
+
+    prevEvaluatedRef.current = evaluatedCharges;
     charges = evaluatedCharges;
-    setChargesState(evaluatedCharges);
     updateChargeMeshes();
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.updateCharges(evaluatedCharges);
+
+    if (changed) {
+      setChargesState(evaluatedCharges);
+      vectorFieldRendererRef.current?.updateCharges(evaluatedCharges);
     }
-  }, [simulationTimeSeconds, sourceDefs, vectorFieldRenderer]);
+  }, [simulationTimeSeconds, sourceDefs]);
 
   useEffect(() => {
     if (!simulationClockRunning) {
@@ -712,6 +727,19 @@ const ThreeWorkspace: React.FC = () => {
     };
   }, []);
 
+  // Periodically refresh the vector field from the live simulation state.
+  // invalidateFieldCache re-enqueues all known positions; the renderer re-reads
+  // the cache (stale values stay until the fresh server response arrives).
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      simulationProviderRef.current.invalidateFieldCache();
+      vectorFieldRendererRef.current?.updateCharges(chargesRef.current);
+    }, 300);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
+
   useEffect(() => {
     simulationProviderRef.current.setSimulationPaused(fdtdPaused);
   }, [fdtdPaused, simulationMode]);
@@ -723,17 +751,13 @@ const ThreeWorkspace: React.FC = () => {
   const toggleVectorField = () => {
     const newVisibility = !showVectorField;
     setShowVectorField(newVisibility);
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.setVisible(newVisibility);
-    }
+    vectorFieldRendererRef.current?.setVisible(newVisibility);
   };
 
   const toggleFieldLines = () => {
     const newVisibility = !showFieldLines;
     setShowFieldLines(newVisibility);
-    if (fieldLineRenderer) {
-      fieldLineRenderer.setVisible(newVisibility);
-    }
+    fieldLineRendererRef.current?.setVisible(newVisibility);
   };
 
   const selectedSource = selectedCharge

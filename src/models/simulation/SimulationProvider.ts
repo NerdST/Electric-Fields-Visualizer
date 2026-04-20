@@ -32,6 +32,13 @@ export interface SimulationProvider {
     samplePotentialAt(position: THREE.Vector3): number;
     getStats(): SimulationStats;
     dispose(): void;
+    /**
+     * Mark all cached field samples as stale and re-request them from the simulation.
+     * Stale values continue to be served until fresh data arrives — no flash to the
+     * analytical fallback.  Call periodically when the simulation is running to keep
+     * the rendered field in sync with the evolving FDTD state.
+     */
+    invalidateFieldCache(): void;
 }
 
 export class AnalyticalSimulationProvider implements SimulationProvider {
@@ -90,6 +97,10 @@ export class AnalyticalSimulationProvider implements SimulationProvider {
         };
     }
 
+    public invalidateFieldCache(): void {
+        // Analytical mode recomputes on every call — nothing to invalidate.
+    }
+
     public dispose(): void {
         this.charges = [];
     }
@@ -110,6 +121,8 @@ class FDTDSimulationProvider implements SimulationProvider {
     private disposed = false;
     private readyPromise: Promise<void>;
     private readonly sampleCache = new Map<string, ElectricFieldResult>();
+    // Stores the world-space position for each cache key so we can re-request on invalidation.
+    private readonly cachedPositions = new Map<string, THREE.Vector3>();
     private readonly pendingSamples = new Set<string>();
     private tickTimer: number | null = null;
     private lastTickTimeMs = 0;
@@ -194,8 +207,19 @@ class FDTDSimulationProvider implements SimulationProvider {
 
         const fallback = electricFieldAt(position, this.charges);
         this.sampleCache.set(cacheKey, fallback);
+        this.cachedPositions.set(cacheKey, position.clone());
         void this.requestSample(position, cacheKey, fallback.potential);
         return fallback;
+    }
+
+    public invalidateFieldCache(): void {
+        // Re-request every position we've seen before.  The stale cached values
+        // continue to be served until the GPU readback completes — no Coulomb flash.
+        this.pendingSamples.clear();
+        for (const [key, pos] of this.cachedPositions) {
+            const cached = this.sampleCache.get(key);
+            void this.requestSample(pos, key, cached?.potential ?? 0);
+        }
     }
 
     public samplePotentialAt(position: THREE.Vector3): number {
@@ -223,6 +247,7 @@ class FDTDSimulationProvider implements SimulationProvider {
         this.disposed = true;
         this.stopTickLoop();
         this.sampleCache.clear();
+        this.cachedPositions.clear();
         this.pendingSamples.clear();
         if (this.fdtdSimulation) {
             this.fdtdSimulation.destroy();

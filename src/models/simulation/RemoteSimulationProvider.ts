@@ -21,11 +21,6 @@ type RemoteStats = {
     targetSps: number;
 };
 
-type PendingRequest = {
-    positions: THREE.Vector3[];
-    cacheKeys: string[];
-};
-
 /** Milliseconds between batch sample flushes (one WebSocket message per frame tick). */
 const BATCH_INTERVAL_MS = 16;
 
@@ -45,6 +40,9 @@ export class RemoteSimulationProvider implements SimulationProvider {
     private disposed = false;
 
     private readonly sampleCache = new Map<string, ElectricFieldResult>();
+    // Tracks the world-space position for every key that has been cached,
+    // so invalidateFieldCache() can re-enqueue them all without clearing stale values.
+    private readonly cachedPositions = new Map<string, THREE.Vector3>();
     private readonly pendingBatch = new Map<string, THREE.Vector3>();
     private batchTimer: number | null = null;
     private requestIdCounter = 0;
@@ -82,6 +80,7 @@ export class RemoteSimulationProvider implements SimulationProvider {
     public setCharges(charges: Charge[]): void {
         this.charges = [...charges];
         this.sampleCache.clear();
+        this.cachedPositions.clear();
         this._sendCharges();
     }
 
@@ -93,18 +92,21 @@ export class RemoteSimulationProvider implements SimulationProvider {
             this.charges.push(charge);
         }
         this.sampleCache.clear();
+        this.cachedPositions.clear();
         this._sendCharges();
     }
 
     public removeCharge(chargeId: string): void {
         this.charges = this.charges.filter((c) => c.id !== chargeId);
         this.sampleCache.clear();
+        this.cachedPositions.clear();
         this._sendCharges();
     }
 
     public clearCharges(): void {
         this.charges = [];
         this.sampleCache.clear();
+        this.cachedPositions.clear();
         this._sendCharges();
     }
 
@@ -129,6 +131,7 @@ export class RemoteSimulationProvider implements SimulationProvider {
         // Return analytical fallback immediately, queue remote sample
         const fallback = electricFieldAt(position, this.charges);
         this.sampleCache.set(key, fallback);
+        this.cachedPositions.set(key, position.clone());
         this._enqueueSample(key, position);
         return fallback;
     }
@@ -152,6 +155,20 @@ export class RemoteSimulationProvider implements SimulationProvider {
         };
     }
 
+    public invalidateFieldCache(): void {
+        // Re-enqueue every known position without clearing stale values.
+        // Stale data continues to render until fresh server response arrives.
+        for (const [key, pos] of this.cachedPositions) {
+            this.pendingBatch.set(key, pos);
+        }
+        if (this.pendingBatch.size > 0 && this.batchTimer === null) {
+            this.batchTimer = window.setTimeout(() => {
+                this.batchTimer = null;
+                this._flushBatch();
+            }, BATCH_INTERVAL_MS);
+        }
+    }
+
     public dispose(): void {
         this.disposed = true;
         if (this.batchTimer !== null) {
@@ -159,6 +176,7 @@ export class RemoteSimulationProvider implements SimulationProvider {
             this.batchTimer = null;
         }
         this.sampleCache.clear();
+        this.cachedPositions.clear();
         this.pendingBatch.clear();
         this.inflightRequests.clear();
         if (this.ws) {

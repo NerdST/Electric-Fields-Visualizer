@@ -24,6 +24,14 @@ export class FieldLineRenderer {
   private charges: Charge[] = [];
   private lineGroup: THREE.Group;
 
+  // Pooled temporaries for RK4 — reused across every step of every trace to avoid
+  // thousands of short-lived Vector3 allocations per updateCharges() call.
+  private readonly _k1 = new THREE.Vector3();
+  private readonly _k2 = new THREE.Vector3();
+  private readonly _k3 = new THREE.Vector3();
+  private readonly _k4 = new THREE.Vector3();
+  private readonly _tmp = new THREE.Vector3();
+
   constructor(scene: THREE.Scene, config: FieldLineConfig) {
     this.scene = scene;
     this.config = config;
@@ -34,50 +42,56 @@ export class FieldLineRenderer {
   }
 
   /**
-   * Runge-Kutta 4th order integration step
-   * Traces one step along the field line
+   * Runge-Kutta 4th order integration step.
+   * Uses pooled Vector3s (_k1–_k4, _tmp) to avoid per-step heap allocations.
+   * Returns a NEW Vector3 for the next position (caller owns it).
    */
   private rk4Step(
     position: THREE.Vector3,
     charges: Charge[],
     stepSize: number
   ): THREE.Vector3 {
-    const k1 = this.getFieldDirection(position, charges);
-    if (k1.lengthSq() < 1e-12) return position.clone();
+    const { _k1, _k2, _k3, _k4, _tmp } = this;
 
-    const k2Pos = position.clone().add(k1.clone().multiplyScalar(stepSize * 0.5));
-    const k2 = this.getFieldDirection(k2Pos, charges);
+    this.getFieldDirection(position, charges, _k1);
+    if (_k1.lengthSq() < 1e-12) return position.clone();
 
-    const k3Pos = position.clone().add(k2.clone().multiplyScalar(stepSize * 0.5));
-    const k3 = this.getFieldDirection(k3Pos, charges);
+    // k2: sample at position + k1 * h/2
+    _tmp.copy(position).addScaledVector(_k1, stepSize * 0.5);
+    this.getFieldDirection(_tmp, charges, _k2);
 
-    const k4Pos = position.clone().add(k3.clone().multiplyScalar(stepSize));
-    const k4 = this.getFieldDirection(k4Pos, charges);
+    // k3: sample at position + k2 * h/2
+    _tmp.copy(position).addScaledVector(_k2, stepSize * 0.5);
+    this.getFieldDirection(_tmp, charges, _k3);
 
-    // Weighted average (clone vectors to avoid mutation)
-    const weightedDirection = k1
-      .clone()
-      .add(k2.clone().multiplyScalar(2))
-      .add(k3.clone().multiplyScalar(2))
-      .add(k4)
+    // k4: sample at position + k3 * h
+    _tmp.copy(position).addScaledVector(_k3, stepSize);
+    this.getFieldDirection(_tmp, charges, _k4);
+
+    // Weighted sum: (k1 + 2*k2 + 2*k3 + k4) * h/6
+    _tmp.copy(_k1)
+      .addScaledVector(_k2, 2)
+      .addScaledVector(_k3, 2)
+      .add(_k4)
       .multiplyScalar(stepSize / 6);
 
-    return position.clone().add(weightedDirection);
+    return position.clone().add(_tmp);
   }
 
   /**
-   * Get normalized field direction at a point
+   * Write the normalized field direction at `position` into `out`.
+   * Returns `out` for chaining convenience.
    */
-  private getFieldDirection(position: THREE.Vector3, charges: Charge[]): THREE.Vector3 {
+  private getFieldDirection(position: THREE.Vector3, charges: Charge[], out: THREE.Vector3): THREE.Vector3 {
     const fieldResult = this.fieldSampler(position, charges);
     const field = fieldResult.field;
     const magnitude = field.length();
 
     if (magnitude < 1e-6) {
-      return new THREE.Vector3(0, 0, 0);
+      return out.set(0, 0, 0);
     }
 
-    return field.normalize();
+    return out.copy(field).normalize();
   }
 
   /**

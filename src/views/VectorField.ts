@@ -81,6 +81,9 @@ export class VectorFieldRenderer {
     return points;
   }
 
+  // Reused per-frame temporaries — avoids per-arrow allocation in the hot loop.
+  private readonly _tempDir = new THREE.Vector3();
+
   private updateVectorField() {
     if (!this.arrowMesh) return;
     const gridPoints = this.gridPoints;
@@ -88,33 +91,34 @@ export class VectorFieldRenderer {
     const position = new THREE.Vector3();
     const scale = new THREE.Vector3();
     const quaternion = new THREE.Quaternion();
+    const tempDir = this._tempDir;
 
     for (let i = 0; i < gridPoints.length; i++) {
       const point = gridPoints[i];
       const fieldResult = this.fieldSampler(point, this.charges);
       const field = fieldResult.field;
+      const magnitude = field.length();
 
-      if (field.length() < 1e-6) {
+      if (magnitude < 1e-6) {
         matrix.makeScale(0, 0, 0);
         this.arrowMesh.setMatrixAt(i, matrix);
         continue;
       }
 
-      let arrowLength = field.length();
+      let arrowLength: number;
       if (this.config.showDirectionOnly) {
         arrowLength = 0.3;
       } else {
-        // CHANGE: Scale field magnitude more reasonably
-        const normalizedMagnitude = Math.min(arrowLength / this.config.maxFieldMagnitude, 1);
-        arrowLength = Math.max(normalizedMagnitude * this.config.arrowScale, 0.1); // Minimize visible size
+        const normalizedMagnitude = Math.min(magnitude / this.config.maxFieldMagnitude, 1);
+        arrowLength = Math.max(normalizedMagnitude * this.config.arrowScale, 0.1);
       }
 
       position.copy(point);
-
       scale.set(1, arrowLength, 1);
 
-      const direction = field.clone().normalize();
-      quaternion.setFromUnitVectors(this.upVector, direction);
+      // Normalise into a reused vector — avoids a heap allocation per arrow.
+      tempDir.copy(field).normalize();
+      quaternion.setFromUnitVectors(this.upVector, tempDir);
 
       matrix.compose(position, quaternion, scale);
       this.arrowMesh.setMatrixAt(i, matrix);
@@ -156,12 +160,8 @@ export class VectorFieldRenderer {
   }
 
   public setVisible(visible: boolean) {
-    console.log('VectorFieldRenderer.setVisible called with:', visible);
     if (this.arrowMesh) {
-      console.log('Setting arrowMesh.visible to:', visible);
       this.arrowMesh.visible = visible;
-    } else {
-      console.log('arrowMesh is null!');
     }
   }
 
