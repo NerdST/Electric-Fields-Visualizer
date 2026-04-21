@@ -25,3 +25,9 @@ dist-ssr
 
 CLAUDE.md
 cloud/__pycache__/
+
+# Stale tsc emission next to .ts sources (poisons Vite's module resolution).
+# The real sources are .ts; these only appear if someone runs `tsc <file>.ts`
+# ad-hoc, which bypasses tsconfig.
+src/**/*.js
+vite.config.js
