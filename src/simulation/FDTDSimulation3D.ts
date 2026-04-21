@@ -47,11 +47,12 @@ export interface FieldSource {
   /**
    * Source type:
    * - 'continuous': sinusoidal oscillation (default)
-   * - 'pulse': Gaussian-modulated pulse — a single burst that propagates outward
+   * - 'pulse': Gaussian-modulated sinusoidal pulse (multiple rings)
+   * - 'impulse': single sharp Gaussian bump — one wavefront, no oscillation
    */
-  type?: 'continuous' | 'pulse';
-  /** Width of the Gaussian envelope in seconds (only for 'pulse' type).
-   *  Controls how many cycles are in the burst. Default: 3 periods. */
+  type?: 'continuous' | 'pulse' | 'impulse';
+  /** Width of the Gaussian envelope in seconds (for 'pulse' and 'impulse' types).
+   *  Default: 3 periods for 'pulse', very narrow for 'impulse'. */
   pulseWidth?: number;
 }
 
@@ -138,6 +139,18 @@ export class FDTDSimulation3D {
     this.sources = [];
   }
 
+  /**
+   * Inject a one-time field perturbation at a grid position.
+   * This is how charges work: stamp a value into the E field,
+   * then Maxwell's equations naturally propagate it outward.
+   * No continuous injection — the physics handles the rest.
+   */
+  public injectImpulse(ix: number, iy: number, iz: number, amplitude: number): void {
+    const idx = this.idx(ix, iy, iz);
+    // Inject into all 3 E components for a spherical-ish wavefront
+    this.Ez[idx] += amplitude;
+  }
+
   /** Get current simulation step count */
   public getStepCount(): number {
     return this.stepCount;
@@ -160,7 +173,6 @@ export class FDTDSimulation3D {
   public step(): void {
     this.updateH();
     this.updateE();
-    this.injectSources();
     this.applyBoundaryConditions();
 
     this.stepCount++;
@@ -263,10 +275,17 @@ export class FDTDSimulation3D {
     for (const source of this.sources) {
       let value: number;
 
-      if (source.type === 'pulse') {
-        // Gaussian pulse: peaks at t0, then decays to zero
-        const sigma = source.pulseWidth ?? (3 / source.frequency); // default: 3 periods wide
-        const t0 = 3 * sigma; // delay so it starts near zero
+      if (source.type === 'impulse') {
+        // Single sharp Gaussian bump — one wavefront, no oscillation
+        // Like dropping a rock in water: one ripple expands outward
+        const sigma = source.pulseWidth ?? (this.dt * 30); // ~30 timesteps wide for stability
+        const t0 = 3 * sigma; // slight delay so it starts near zero
+        const t = this.currentTime;
+        value = source.amplitude * Math.exp(-((t - t0) * (t - t0)) / (2 * sigma * sigma));
+      } else if (source.type === 'pulse') {
+        // Gaussian-modulated sinusoidal pulse (multiple rings)
+        const sigma = source.pulseWidth ?? (3 / source.frequency);
+        const t0 = 3 * sigma;
         const t = this.currentTime;
         const envelope = Math.exp(-((t - t0) * (t - t0)) / (2 * sigma * sigma));
         value = source.amplitude * envelope * Math.sin(2 * Math.PI * source.frequency * t);
@@ -288,46 +307,44 @@ export class FDTDSimulation3D {
   }
 
   /**
-   * Apply simple absorbing boundary conditions.
+   * Absorbing boundary conditions using a damping sponge layer.
    *
-   * For now, we zero the fields at the grid boundaries. This is the simplest
-   * approach (PEC — Perfect Electric Conductor boundaries). It causes
-   * reflections, but it's stable and easy to understand.
-   *
-   * A future improvement would be Mur ABC or PML (Perfectly Matched Layer)
-   * for absorbing outgoing waves without reflection.
+   * Instead of PEC (which reflects waves), we apply exponential damping
+   * in a layer near each boundary. Fields are multiplied by a decay factor
+   * that increases toward the edges, absorbing outgoing waves so they
+   * fade away instead of bouncing back.
    */
+  private readonly spongeDepth = 6; // cells of damping near each boundary
+  private readonly maxDamping = 0.6; // damping factor at the outermost cell (0 = full absorb, 1 = no absorb)
+
   private applyBoundaryConditions(): void {
     const { nx, ny, nz } = this;
+    const depth = Math.min(this.spongeDepth, Math.floor(Math.min(nx, ny, nz) / 4));
 
-    // Zero E fields on all 6 faces of the grid
     for (let k = 0; k < nz; k++) {
       for (let j = 0; j < ny; j++) {
-        // x = 0 and x = nx-1 faces
-        const i0 = this.idx(0, j, k);
-        const i1 = this.idx(nx - 1, j, k);
-        this.Ex[i0] = 0; this.Ey[i0] = 0; this.Ez[i0] = 0;
-        this.Ex[i1] = 0; this.Ey[i1] = 0; this.Ez[i1] = 0;
-      }
-    }
+        for (let i = 0; i < nx; i++) {
+          // How deep into the sponge layer is this cell?
+          // 0 = not in sponge, depth = at the boundary edge
+          const di = Math.max(0, depth - i, i - (nx - 1 - depth));
+          const dj = Math.max(0, depth - j, j - (ny - 1 - depth));
+          const dk = Math.max(0, depth - k, k - (nz - 1 - depth));
+          const d = Math.max(di, dj, dk);
 
-    for (let k = 0; k < nz; k++) {
-      for (let i = 0; i < nx; i++) {
-        // y = 0 and y = ny-1 faces
-        const j0 = this.idx(i, 0, k);
-        const j1 = this.idx(i, ny - 1, k);
-        this.Ex[j0] = 0; this.Ey[j0] = 0; this.Ez[j0] = 0;
-        this.Ex[j1] = 0; this.Ey[j1] = 0; this.Ez[j1] = 0;
-      }
-    }
+          if (d <= 0) continue; // not in sponge layer
 
-    for (let j = 0; j < ny; j++) {
-      for (let i = 0; i < nx; i++) {
-        // z = 0 and z = nz-1 faces
-        const k0 = this.idx(i, j, 0);
-        const k1 = this.idx(i, j, nz - 1);
-        this.Ex[k0] = 0; this.Ey[k0] = 0; this.Ez[k0] = 0;
-        this.Ex[k1] = 0; this.Ey[k1] = 0; this.Ez[k1] = 0;
+          // Quadratic damping profile: stronger near the edge
+          const t = d / depth; // 0 at sponge inner edge, 1 at grid boundary
+          const decay = 1.0 - t * t * (1.0 - this.maxDamping);
+
+          const idx = this.idx(i, j, k);
+          this.Ex[idx] *= decay;
+          this.Ey[idx] *= decay;
+          this.Ez[idx] *= decay;
+          this.Hx[idx] *= decay;
+          this.Hy[idx] *= decay;
+          this.Hz[idx] *= decay;
+        }
       }
     }
   }
