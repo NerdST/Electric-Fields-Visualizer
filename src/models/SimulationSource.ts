@@ -35,9 +35,7 @@ export function createDefaultSource(id: string, position?: THREE.Vector3): Simul
     };
 }
 
-export function evaluateSourceMagnitude(source: SimulationSource, timeSeconds: number): number {
-    const wf = source.waveform;
-
+export function evaluateWaveform(wf: SourceWaveform, timeSeconds: number): number {
     if (wf.type === 'dc') {
         return wf.offset;
     }
@@ -51,6 +49,10 @@ export function evaluateSourceMagnitude(source: SimulationSource, timeSeconds: n
     const localTime = ((timeSeconds + wf.phaseRad / (2 * Math.PI * Math.max(wf.frequencyHz, 1e-6))) % period + period) % period;
     const isHigh = localTime < period * duty;
     return wf.offset + (isHigh ? wf.amplitude : -wf.amplitude);
+}
+
+export function evaluateSourceMagnitude(source: SimulationSource, timeSeconds: number): number {
+    return evaluateWaveform(source.waveform, timeSeconds);
 }
 
 export function evaluateSourceCharge(source: SimulationSource, timeSeconds: number): Charge {

@@ -1,15 +1,9 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import * as THREE from 'three';
 import { WebGPURenderer } from 'three/webgpu';
-import { createDefaultCharge, createCharge, electricFieldAt } from '../models/Charge';
-import type { Charge } from '../models/Charge';
-import {
-  createDefaultSource,
-  evaluateSourcesToCharges,
-  type SimulationSource,
-  type SourceWaveformType,
-} from '../models/SimulationSource';
+import { electricFieldAt, type Charge } from '../models/Charge';
+import { evaluateWaveform, type SourceWaveformType } from '../models/SimulationSource';
 import { VectorFieldRenderer, createDefaultVectorFieldConfig } from '../views/VectorField';
 import { FieldLineRenderer, createDefaultFieldLineConfig } from '../views/FieldLines';
 import { createVoltagePoint } from '../models/VoltagePoint';
@@ -20,6 +14,15 @@ import {
   type SimulationProvider,
   type SimulationStats,
 } from '../models/simulation/SimulationProvider';
+import {
+  createDefaultPointCharge,
+  getAllDescriptors,
+  getDescriptor,
+  type SimObject,
+  type SimObjectKind,
+  type SimObjectRenderer,
+  type PointChargeObject,
+} from '../models/simobject';
 
 let renderer: WebGPURenderer | THREE.WebGLRenderer;
 const scene = new THREE.Scene();
@@ -47,92 +50,26 @@ scene.add(axesHelper);
 const gridHelper = new THREE.GridHelper(20, 20, 0x444444, 0x222222);
 (scene as any).add(gridHelper);
 
-// Charge/voltage geometries & materials
-const chargeGeometry = new THREE.SphereGeometry(0.2, 16, 16);
-const positiveChargeMaterial = new THREE.MeshStandardMaterial({ color: 0xff4444 });
-const negativeChargeMaterial = new THREE.MeshStandardMaterial({ color: 0x4444ff });
-// Shared outline — created once and reused on the selected charge mesh each frame.
-const outlineGeometry = new THREE.SphereGeometry(0.25, 16, 16);
-const outlineMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00, wireframe: true, transparent: true, opacity: 0.8 });
+// Raycast scratch state shared by click handler
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
 
-// Add some default charges
-const charge1 = createDefaultCharge('charge-1');
-charge1.position.set(0, 0, 0);
-charge1.magnitude = 1e-6;
-
-const source1 = createDefaultSource('charge-1', charge1.position.clone());
-source1.waveform.offset = charge1.magnitude;
-
-let charges: Charge[] = [charge1];
-
-// Create charge visualizations
-let chargeMeshes: Map<string, THREE.Mesh> = new Map();
-let selectedChargeId: string | null = null;
-let raycaster = new THREE.Raycaster();
-let mouse = new THREE.Vector2();
-
-// Voltage point visualizations
-let voltagePointMeshes: Map<string, THREE.Mesh> = new Map();
-let voltagePointArrows: Map<string, THREE.Mesh[]> = new Map();
+// Voltage point visualizations — legacy path, migrated in Slice D.
+const voltagePointMeshes: Map<string, THREE.Mesh> = new Map();
+const voltagePointArrows: Map<string, THREE.Mesh[]> = new Map();
 const voltagePointGeometry = new THREE.SphereGeometry(0.15, 12, 12);
 const voltagePointMaterial = new THREE.MeshBasicMaterial({
   color: 0x00ff00,
   transparent: true,
   opacity: 0.8,
 });
-
-// Arrow geometry for voltage points (same size as field arrows)
 const voltageArrowGeometry = new THREE.ConeGeometry(0.05, 0.2, 8);
 const voltageArrowMaterial = new THREE.MeshBasicMaterial({
-  color: 0x4444ff, // Blue color
+  color: 0x4444ff,
   transparent: true,
   opacity: 0.8,
 });
 
-const updateChargeMeshes = () => {
-  const seen: Set<string> = new Set();
-
-  for (const charge of charges) {
-    seen.add(charge.id);
-    let mesh = chargeMeshes.get(charge.id);
-    const desiredMaterial =
-      charge.magnitude > 0 ? positiveChargeMaterial : negativeChargeMaterial;
-    if (!mesh) {
-      mesh = new THREE.Mesh(chargeGeometry, desiredMaterial);
-      mesh.userData = { chargeId: charge.id };
-      scene.add(mesh);
-      chargeMeshes.set(charge.id, mesh);
-    } else {
-      const isPositive = mesh.material === positiveChargeMaterial;
-      if ((isPositive && charge.magnitude < 0) || (!isPositive && charge.magnitude > 0)) {
-        mesh.material = desiredMaterial;
-      }
-    }
-    mesh.position.copy(charge.position);
-
-    // Selection highlight — only mutate the child outline when selection state changes.
-    const isSelected = selectedChargeId === charge.id;
-    if (mesh.userData.outlined !== isSelected) {
-      mesh.children
-        .filter((c) => (c as any).isMesh)
-        .forEach((child) => mesh && mesh.remove(child));
-      if (isSelected) {
-        mesh.add(new THREE.Mesh(outlineGeometry, outlineMaterial));
-      }
-      mesh.userData.outlined = isSelected;
-    }
-    mesh.scale.setScalar(isSelected ? 1.5 : 1.0);
-  }
-
-  for (const [id, mesh] of Array.from(chargeMeshes.entries())) {
-    if (!seen.has(id)) {
-      scene.remove(mesh);
-      chargeMeshes.delete(id);
-    }
-  }
-};
-
-// Function to update voltage point meshes
 const updateVoltagePointMeshes = (
   voltagePoints: VoltagePoint[],
   sampleFieldAt: (position: THREE.Vector3) => { field: THREE.Vector3; potential: number },
@@ -143,12 +80,10 @@ const updateVoltagePointMeshes = (
   const arrowScale = 2.0;
   const maxFieldMagnitude = 1e4;
 
-  // Generate points around each voltage orb in a small grid
-  const gridSize = 3; // 3x3x3 grid around each orb
-  const gridStep = 0.4; // Distance between grid points
+  const gridSize = 3;
+  const gridStep = 0.4;
   const gridOffset = -(gridSize - 1) * gridStep / 2;
 
-  // Update existing and create missing
   for (const point of voltagePoints) {
     seen.add(point.id);
     let mesh = voltagePointMeshes.get(point.id);
@@ -160,25 +95,19 @@ const updateVoltagePointMeshes = (
     }
     mesh.position.copy(point.position);
 
-    // Create or update arrows for this voltage point
     let arrows = voltagePointArrows.get(point.id);
 
-    // Calculate positions for arrows around the orb
     const arrowPositions: THREE.Vector3[] = [];
     for (let x = 0; x < gridSize; x++) {
       for (let y = 0; y < gridSize; y++) {
         for (let z = 0; z < gridSize; z++) {
-          // Skip the center position (where the orb is)
           if (x === 1 && y === 1 && z === 1) continue;
-
           const offset = new THREE.Vector3(
             gridOffset + x * gridStep,
             gridOffset + y * gridStep,
-            gridOffset + z * gridStep
+            gridOffset + z * gridStep,
           );
           const arrowPos = point.position.clone().add(offset);
-
-          // Only add arrows that are at a reasonable distance from the orb
           const distance = offset.length();
           if (distance > sphereRadius && distance < sphereRadius + 0.6) {
             arrowPositions.push(arrowPos);
@@ -187,7 +116,6 @@ const updateVoltagePointMeshes = (
       }
     }
 
-    // Remove old arrows if count changed
     if (arrows && arrows.length !== arrowPositions.length) {
       for (const arrow of arrows) {
         scene.remove(arrow);
@@ -209,40 +137,28 @@ const updateVoltagePointMeshes = (
       voltagePointArrows.set(point.id, arrows);
     }
 
-    // Update arrow positions and orientations based on electric field
     for (let i = 0; i < arrowPositions.length && i < arrows.length; i++) {
       const arrow = arrows[i];
       const arrowPos = arrowPositions[i];
-
-      // Calculate electric field at this position
       const fieldResult = sampleFieldAt(arrowPos);
       const field = fieldResult.field;
-
       let arrowLength = field.length();
 
       if (field.length() < 1e-6) {
-        // Hide arrow if field is too small
         arrow.scale.set(0, 0, 0);
         continue;
       }
 
       const normalizedMagnitude = Math.min(arrowLength / maxFieldMagnitude, 1);
       arrowLength = Math.max(normalizedMagnitude * arrowScale, 0.1);
-
-      // Position arrow at the grid position (same as vector field)
       arrow.position.copy(arrowPos);
-
-      // Orient arrow in field direction
       const direction = field.clone().normalize();
       const quaternion = new THREE.Quaternion().setFromUnitVectors(upVector, direction);
       arrow.setRotationFromQuaternion(quaternion);
-
-      // Scale arrow (length along Y axis) - exactly like vector field
       arrow.scale.set(1, arrowLength, 1);
     }
   }
 
-  // Remove meshes and arrows that no longer have voltage points
   for (const [id, mesh] of Array.from(voltagePointMeshes.entries())) {
     if (!seen.has(id)) {
       scene.remove(mesh);
@@ -261,8 +177,9 @@ const updateVoltagePointMeshes = (
   }
 };
 
-// Initialize charge meshes
-updateChargeMeshes();
+function createInitialObjects(): SimObject[] {
+  return [createDefaultPointCharge('charge-1')];
+}
 
 function animate() {
   requestAnimationFrame(animate);
@@ -274,20 +191,18 @@ const ThreeWorkspace: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [simulationMode, setSimulationMode] = useState<SimulationMode>('analytical');
   const [remoteServerUrl, setRemoteServerUrl] = useState('ws://localhost:8765/ws');
-  const [simulationStats, setSimulationStats] = useState<SimulationStats>(
-    {
-      mode: 'analytical',
-      ready: true,
-      usingFallback: false,
-      paused: true,
-      storageMode: '2d',
-      targetStepsPerSecond: 0,
-      steps: 0,
-      stepsPerSecond: 0,
-      dt: 0,
-      sampleCacheSize: 0,
-    },
-  );
+  const [simulationStats, setSimulationStats] = useState<SimulationStats>({
+    mode: 'analytical',
+    ready: true,
+    usingFallback: false,
+    paused: true,
+    storageMode: '2d',
+    targetStepsPerSecond: 0,
+    steps: 0,
+    stepsPerSecond: 0,
+    dt: 0,
+    sampleCacheSize: 0,
+  });
   const [fdtdPaused, setFdtdPaused] = useState(true);
   const [fdtdTargetSps, setFdtdTargetSps] = useState(240);
   const simulationProviderRef = useRef<SimulationProvider>(
@@ -305,54 +220,67 @@ const ThreeWorkspace: React.FC = () => {
   const [simulationTimeSeconds, setSimulationTimeSeconds] = useState(0);
   const [simulationClockRunning, setSimulationClockRunning] = useState(false);
   const [simulationTimeScale, setSimulationTimeScale] = useState(1);
-  const [sourceDefs, setSourceDefs] = useState<SimulationSource[]>([source1]);
   const simulationClockRef = useRef<number | null>(null);
   const lastFrameTimeRef = useRef<number | null>(null);
 
-  useEffect(() => {
-    simulationProviderRef.current.dispose();
-    simulationProviderRef.current = createSimulationProvider(simulationMode, remoteServerUrl);
-    simulationProviderRef.current.setCharges(chargesState);
-    simulationProviderRef.current.setSimulationPaused(fdtdPaused);
-    simulationProviderRef.current.setTargetStepsPerSecond(fdtdTargetSps);
-    setSimulationStats(simulationProviderRef.current.getStats());
+  // Unified SimObject state — single source of truth for everything placeable in the scene.
+  const [objects, setObjects] = useState<SimObject[]>(createInitialObjects);
+  const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
+  const [objectStack, setObjectStack] = useState<string[]>([]);
+  const objectsRef = useRef(objects);
+  useEffect(() => { objectsRef.current = objects; }, [objects]);
 
-    if (vectorFieldRenderer) {
-      vectorFieldRenderer.updateCharges(chargesState);
-    }
-    if (fieldLineRenderer) {
-      fieldLineRenderer.updateCharges(chargesState);
-    }
-  }, [simulationMode, remoteServerUrl]);
-
-  const [vectorFieldRenderer, setVectorFieldRenderer] =
-    useState<VectorFieldRenderer | null>(null);
-  const [showVectorField, setShowVectorField] = useState(true);
-  const [fieldLineRenderer, setFieldLineRenderer] =
-    useState<FieldLineRenderer | null>(null);
-  const [showFieldLines, setShowFieldLines] = useState(false);
-
-  // Refs that always point to the latest renderer instances — used for stable access
-  // in event handlers and intervals without stale closure issues.
-  const vectorFieldRendererRef = useRef<VectorFieldRenderer | null>(null);
-  const fieldLineRendererRef = useRef<FieldLineRenderer | null>(null);
-
-  // Charge state mirrors global `charges`
-  const [chargesState, setChargesState] = useState<Charge[]>(charges);
-  const chargesRef = useRef<Charge[]>(chargesState);
+  // Evaluated charges derived from objects each tick, consumed by SimulationProvider and
+  // the view-layer renderers (VectorField, FieldLines). Separate from `objects` so
+  // change-detection can skip resampling when DC sources haven't moved.
+  const [chargesState, setChargesState] = useState<Charge[]>([]);
+  const chargesRef = useRef<Charge[]>([]);
   useEffect(() => {
     chargesRef.current = chargesState;
     simulationProviderRef.current.setCharges(chargesState);
   }, [chargesState]);
+
+  const [showVectorField, setShowVectorField] = useState(true);
+  const [showFieldLines, setShowFieldLines] = useState(false);
+
+  const vectorFieldRendererRef = useRef<VectorFieldRenderer | null>(null);
+  const fieldLineRendererRef = useRef<FieldLineRenderer | null>(null);
+
+  useEffect(() => {
+    simulationProviderRef.current.dispose();
+    simulationProviderRef.current = createSimulationProvider(simulationMode, remoteServerUrl);
+    simulationProviderRef.current.setCharges(chargesRef.current);
+    simulationProviderRef.current.setSimulationPaused(fdtdPaused);
+    simulationProviderRef.current.setTargetStepsPerSecond(fdtdTargetSps);
+    setSimulationStats(simulationProviderRef.current.getStats());
+
+    vectorFieldRendererRef.current?.updateCharges(chargesRef.current);
+    fieldLineRendererRef.current?.updateCharges(chargesRef.current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [simulationMode, remoteServerUrl]);
+
+  // SimObject renderers — one instance per kind, created eagerly from the registry.
+  // Each owns all meshes for objects of its kind; sync() diffs on every object/time/selection change.
+  const renderersRef = useRef<Map<SimObjectKind, SimObjectRenderer<any>>>(new Map());
+  useEffect(() => {
+    const map = new Map<SimObjectKind, SimObjectRenderer<any>>();
+    for (const descriptor of getAllDescriptors()) {
+      map.set(descriptor.kind, descriptor.createRenderer(scene));
+    }
+    renderersRef.current = map;
+    return () => {
+      for (const r of map.values()) r.dispose();
+      renderersRef.current = new Map();
+    };
+  }, []);
 
   // Vector field renderer — owned by this effect (safe under React 18 StrictMode double-invoke)
   useEffect(() => {
     const vectorFieldConfig = createDefaultVectorFieldConfig();
     vectorFieldConfig.fieldSampler = (position, _c) => sampleFieldAtPosition(position);
     const vfRenderer = new VectorFieldRenderer(scene, vectorFieldConfig);
-    vfRenderer.updateCharges(charges);
+    vfRenderer.updateCharges(chargesRef.current);
     vectorFieldRendererRef.current = vfRenderer;
-    setVectorFieldRenderer(vfRenderer);
     return () => {
       vfRenderer.dispose();
       vectorFieldRendererRef.current = null;
@@ -360,8 +288,8 @@ const ThreeWorkspace: React.FC = () => {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Field line renderer — owned by this effect (safe under React 18 StrictMode double-invoke).
-  // 1 Hz refresh interval is co-located here so it's always tied to the live renderer instance.
+  // Field line renderer — owned by this effect. 1 Hz refresh is co-located here so it's always
+  // tied to the live renderer instance.
   useEffect(() => {
     const fieldLineConfig = createDefaultFieldLineConfig();
     fieldLineConfig.fieldSampler = (position, c) => electricFieldAt(position, c);
@@ -369,7 +297,6 @@ const ThreeWorkspace: React.FC = () => {
     flRenderer.updateCharges(chargesRef.current);
     flRenderer.setVisible(false);
     fieldLineRendererRef.current = flRenderer;
-    setFieldLineRenderer(flRenderer);
     const id = window.setInterval(() => {
       flRenderer.updateCharges(chargesRef.current);
     }, 1000);
@@ -383,29 +310,42 @@ const ThreeWorkspace: React.FC = () => {
 
   const prevEvaluatedRef = useRef<Charge[]>([]);
 
+  // Per-tick: evaluate each object's contribution, sync renderers, push changes downstream.
   useEffect(() => {
-    const evaluatedCharges = evaluateSourcesToCharges(sourceDefs, simulationTimeSeconds);
+    const evaluated: Charge[] = [];
+    for (const obj of objects) {
+      const d = getDescriptor(obj.kind);
+      const c = d?.evaluateCharge?.(obj, simulationTimeSeconds);
+      if (c) evaluated.push(c);
+    }
 
     // Only push updates downstream when charge values actually differ.
     // For DC sources this skips redundant React re-renders and vector field resampling
     // every animation frame even though nothing changed.
     const prev = prevEvaluatedRef.current;
     const changed =
-      evaluatedCharges.length !== prev.length ||
-      evaluatedCharges.some((c, i) => {
+      evaluated.length !== prev.length ||
+      evaluated.some((c, i) => {
         const p = prev[i];
         return c.magnitude !== p.magnitude || !c.position.equals(p.position);
       });
+    prevEvaluatedRef.current = evaluated;
 
-    prevEvaluatedRef.current = evaluatedCharges;
-    charges = evaluatedCharges;
-    updateChargeMeshes();
+    const byKind = new Map<SimObjectKind, SimObject[]>();
+    for (const obj of objects) {
+      const arr = byKind.get(obj.kind) ?? [];
+      arr.push(obj);
+      byKind.set(obj.kind, arr);
+    }
+    for (const [kind, r] of renderersRef.current) {
+      r.sync(byKind.get(kind) ?? [], selectedObjectId, simulationTimeSeconds);
+    }
 
     if (changed) {
-      setChargesState(evaluatedCharges);
-      vectorFieldRendererRef.current?.updateCharges(evaluatedCharges);
+      setChargesState(evaluated);
+      vectorFieldRendererRef.current?.updateCharges(evaluated);
     }
-  }, [simulationTimeSeconds, sourceDefs]);
+  }, [objects, simulationTimeSeconds, selectedObjectId]);
 
   useEffect(() => {
     if (!simulationClockRunning) {
@@ -437,150 +377,103 @@ const ThreeWorkspace: React.FC = () => {
     };
   }, [simulationClockRunning, simulationTimeScale]);
 
-  const [selectedCharge, setSelectedCharge] = useState<Charge | null>(null);
-  const [chargeStack, setChargeStack] = useState<string[]>([]);
+  const selectedObject = useMemo(
+    () => (selectedObjectId ? objects.find((o) => o.id === selectedObjectId) ?? null : null),
+    [objects, selectedObjectId],
+  );
+  const selectedPointCharge: PointChargeObject | null =
+    selectedObject && selectedObject.kind === 'pointCharge' ? selectedObject : null;
+
   const [positionInputs, setPositionInputs] = useState({ x: '', y: '', z: '' });
-  const selectedChargeIdRef = useRef<string | null>(null);
+  const prevSelectedIdRef = useRef<string | null>(null);
   const isEditingPositionRef = useRef(false);
 
   useEffect(() => {
-    if (!isEditingPositionRef.current && selectedCharge && selectedCharge.id !== selectedChargeIdRef.current) {
-      selectedChargeIdRef.current = selectedCharge.id;
+    if (!selectedPointCharge) {
+      prevSelectedIdRef.current = null;
+      return;
+    }
+    if (!isEditingPositionRef.current && selectedPointCharge.id !== prevSelectedIdRef.current) {
+      prevSelectedIdRef.current = selectedPointCharge.id;
       setPositionInputs({
-        x: selectedCharge.position.x.toString(),
-        y: selectedCharge.position.y.toString(),
-        z: selectedCharge.position.z.toString(),
+        x: selectedPointCharge.position.x.toString(),
+        y: selectedPointCharge.position.y.toString(),
+        z: selectedPointCharge.position.z.toString(),
       });
-    } else if (!selectedCharge) {
-      selectedChargeIdRef.current = null;
     }
-  }, [selectedCharge?.id]);
+  }, [selectedPointCharge]);
 
-  useEffect(() => {
-    if (selectedCharge && !isEditingPositionRef.current) {
-      const currentCharge = chargesState.find(c => c.id === selectedCharge.id);
-      if (currentCharge && currentCharge.id === selectedChargeIdRef.current) {
-        setSelectedCharge(currentCharge);
-      }
-    }
-  }, [chargesState, selectedCharge?.id]);
-
-  // Voltage measurement points (computed via electricFieldAt)
   const [voltagePoints, setVoltagePoints] = useState<VoltagePoint[]>([]);
   const [showVoltagePointUI, setShowVoltagePointUI] = useState(false);
-  const [newVoltagePoint, setNewVoltagePoint] = useState({
-    x: 0,
-    y: 0,
-    z: 0,
-  });
+  const [newVoltagePoint, setNewVoltagePoint] = useState({ x: 0, y: 0, z: 0 });
 
-  // Pin probe: recalculate voltage at all measurement points when charges change
   useEffect(() => {
     if (voltagePoints.length === 0) return;
-    const updated = voltagePoints.map((point) => {
-      return {
-        ...point,
-        voltage: samplePotentialAtPosition(point.position),
-      };
-    });
+    const updated = voltagePoints.map((point) => ({
+      ...point,
+      voltage: samplePotentialAtPosition(point.position),
+    }));
     setVoltagePoints(updated);
     updateVoltagePointMeshes(updated, sampleFieldAtPosition);
   }, [chargesState, sampleFieldAtPosition, samplePotentialAtPosition]);
 
-  // Hover voltage readout
   const [hoverVoltage, setHoverVoltage] = useState<number | null>(null);
   const [hoverPosition, setHoverPosition] = useState<THREE.Vector3 | null>(null);
 
-  // Charge management
-  const addCharge = useCallback(() => {
-    const newCharge = createCharge(
-      new THREE.Vector3(
-        (Math.random() - 0.5) * 10,
-        (Math.random() - 0.5) * 10,
-        (Math.random() - 0.5) * 10,
-      ),
-      Math.random() > 0.5 ? 1e-6 : -1e-6,
-      `charge-${Date.now()}`,
+  // --- SimObject CRUD ------------------------------------------------------
+  const addPointCharge = useCallback(() => {
+    const obj = createDefaultPointCharge(`charge-${Date.now()}`);
+    obj.position.set(
+      (Math.random() - 0.5) * 10,
+      (Math.random() - 0.5) * 10,
+      (Math.random() - 0.5) * 10,
     );
-
-    const newSource = createDefaultSource(newCharge.id, newCharge.position);
-    newSource.waveform.offset = newCharge.magnitude;
-    setSourceDefs((prev) => [...prev, newSource]);
-    setChargeStack((prev) => [...prev, newCharge.id]);
+    obj.waveform.offset = Math.random() > 0.5 ? 1e-6 : -1e-6;
+    setObjects((prev) => [...prev, obj]);
+    setObjectStack((prev) => [...prev, obj.id]);
   }, []);
-
-  const removeCharge = useCallback(
-    (chargeId: string) => {
-      setSourceDefs((prev) => prev.filter((source) => source.id !== chargeId));
-      setSelectedCharge(null);
-      selectedChargeId = null;
-
-      setChargeStack((prev) => prev.filter((id) => id !== chargeId));
-    },
-    [],
-  );
 
   const removeLastAdded = useCallback(() => {
-    if (chargeStack.length > 0) {
-      const lastChargeId = chargeStack[chargeStack.length - 1];
-      removeCharge(lastChargeId);
-    }
-  }, [chargeStack, removeCharge]);
-
-  const removeAllCharges = useCallback(() => {
-    setSourceDefs([]);
-    setSelectedCharge(null);
-    setChargeStack([]);
-    selectedChargeId = null;
+    setObjectStack((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      setObjects((os) => os.filter((o) => o.id !== last));
+      setSelectedObjectId((cur) => (cur === last ? null : cur));
+      return prev.slice(0, -1);
+    });
   }, []);
 
-  const selectCharge = useCallback(
-    (chargeId: string) => {
-      // Use chargesRef (always current) instead of chargesState so this callback
-      // is stable and doesn't change every frame, which would re-run the setup
-      // useEffect and dispose the field line renderer.
-      const charge = chargesRef.current.find((c) => c.id === chargeId);
-      if (charge) {
-        setSelectedCharge(charge);
-        selectedChargeId = chargeId;
-        updateChargeMeshes();
-      }
+  const removeAllCharges = useCallback(() => {
+    setObjects((prev) => prev.filter((o) => o.kind !== 'pointCharge'));
+    setObjectStack([]);
+    setSelectedObjectId(null);
+  }, []);
+
+  const updatePointChargeWaveform = useCallback(
+    (
+      id: string,
+      field: 'type' | 'offset' | 'amplitude' | 'frequencyHz' | 'phaseRad' | 'dutyCycle',
+      value: number | SourceWaveformType,
+    ) => {
+      setObjects((prev) => prev.map((o) => {
+        if (o.id !== id || o.kind !== 'pointCharge') return o;
+        return { ...o, waveform: { ...o.waveform, [field]: value } };
+      }));
     },
     [],
   );
 
-  const updateChargeMagnitude = useCallback(
-    (chargeId: string, magnitude: number) => {
-      setSourceDefs((prev) => prev.map((source) => (
-        source.id === chargeId
-          ? {
-            ...source,
-            waveform: {
-              ...source.waveform,
-              offset: magnitude,
-            },
-          }
-          : source
-      )));
+  const updatePointChargePosition = useCallback(
+    (id: string, position: THREE.Vector3) => {
+      setObjects((prev) => prev.map((o) => {
+        if (o.id !== id || o.kind !== 'pointCharge') return o;
+        return { ...o, position: position.clone() };
+      }));
     },
     [],
   );
 
-  const updateChargePosition = useCallback(
-    (chargeId: string, position: THREE.Vector3) => {
-      setSourceDefs((prev) => prev.map((source) => (
-        source.id === chargeId
-          ? {
-            ...source,
-            position: position.clone(),
-          }
-          : source
-      )));
-    },
-    [],
-  );
-
-  // Voltage point management (points store physically computed potentials)
+  // --- Voltage point management (legacy path) ------------------------------
   const addVoltagePoint = useCallback(() => {
     const position = new THREE.Vector3(
       newVoltagePoint.x,
@@ -608,39 +501,37 @@ const ThreeWorkspace: React.FC = () => {
     updateVoltagePointMeshes([], sampleFieldAtPosition);
   }, [sampleFieldAtPosition]);
 
-  const handleMouseClick = useCallback(
-    (event: MouseEvent) => {
-      if (!controls) return;
+  const handleMouseClick = useCallback((event: MouseEvent) => {
+    if (!controls) return;
 
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
-      raycaster.setFromCamera(mouse, camera);
-      const chargeIntersects = raycaster.intersectObjects(
-        Array.from(chargeMeshes.values()),
+    raycaster.setFromCamera(mouse, camera);
+
+    const selectable: THREE.Object3D[] = [];
+    for (const r of renderersRef.current.values()) {
+      selectable.push(...r.getSelectableMeshes());
+    }
+    const objectHits = raycaster.intersectObjects(selectable);
+    const voltageHits = raycaster.intersectObjects(
+      Array.from(voltagePointMeshes.values()),
+    );
+
+    if (objectHits.length > 0) {
+      const clickedId = objectHits[0].object.userData.simObjectId as string | undefined;
+      if (clickedId) setSelectedObjectId(clickedId);
+    } else if (voltageHits.length > 0) {
+      console.log(
+        'Voltage point clicked:',
+        voltageHits[0].object.userData.voltagePointId,
       );
-      const voltageIntersects = raycaster.intersectObjects(
-        Array.from(voltagePointMeshes.values()),
-      );
-
-      if (chargeIntersects.length > 0) {
-        const clickedChargeId = chargeIntersects[0].object.userData.chargeId;
-        selectCharge(clickedChargeId);
-      } else if (voltageIntersects.length > 0) {
-        console.log(
-          'Voltage point clicked:',
-          voltageIntersects[0].object.userData.voltagePointId,
-        );
-      } else {
-        setShowVoltagePointUI(true);
-        setSelectedCharge(null);
-        selectedChargeId = null;
-        updateChargeMeshes();
-      }
-    },
-    [selectCharge],
-  );
+    } else {
+      setShowVoltagePointUI(true);
+      setSelectedObjectId(null);
+    }
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -668,7 +559,6 @@ const ThreeWorkspace: React.FC = () => {
     window.addEventListener('resize', onResize);
     renderer.domElement.addEventListener('click', handleMouseClick);
 
-    // Hover voltage tracking over plane y = 0
     const moveRaycaster = new THREE.Raycaster();
     const moveMouse = new THREE.Vector2();
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -706,7 +596,6 @@ const ThreeWorkspace: React.FC = () => {
     };
   }, [handleMouseClick, sampleFieldAtPosition, samplePotentialAtPosition]);
 
-  // Keep voltage point meshes in sync with state
   useEffect(() => {
     updateVoltagePointMeshes(voltagePoints, sampleFieldAtPosition);
   }, [sampleFieldAtPosition, voltagePoints]);
@@ -727,9 +616,6 @@ const ThreeWorkspace: React.FC = () => {
     };
   }, []);
 
-  // Periodically refresh the vector field from the live simulation state.
-  // invalidateFieldCache re-enqueues all known positions; the renderer re-reads
-  // the cache (stale values stay until the fresh server response arrives).
   useEffect(() => {
     const timer = window.setInterval(() => {
       simulationProviderRef.current.invalidateFieldCache();
@@ -760,31 +646,13 @@ const ThreeWorkspace: React.FC = () => {
     fieldLineRendererRef.current?.setVisible(newVisibility);
   };
 
-  const selectedSource = selectedCharge
-    ? sourceDefs.find((source) => source.id === selectedCharge.id) ?? null
-    : null;
+  const pointCharges = objects.filter((o): o is PointChargeObject => o.kind === 'pointCharge');
 
-  const updateSelectedSourceWaveform = (
-    field: 'type' | 'offset' | 'amplitude' | 'frequencyHz' | 'phaseRad' | 'dutyCycle',
-    value: number | SourceWaveformType,
-  ) => {
-    if (!selectedSource) {
-      return;
-    }
-
-    setSourceDefs((prev) => prev.map((source) => {
-      if (source.id !== selectedSource.id) {
-        return source;
-      }
-      return {
-        ...source,
-        waveform: {
-          ...source.waveform,
-          [field]: value,
-        },
-      };
-    }));
-  };
+  // Evaluated magnitude of the selected point charge — preserves legacy inspector behavior
+  // of showing instantaneous value (matches offset for DC, varies with time for sine/pulse).
+  const selectedEvaluatedMagnitude = selectedPointCharge
+    ? evaluateWaveform(selectedPointCharge.waveform, simulationTimeSeconds)
+    : 0;
 
   return (
     <div style={{ position: 'relative', width: '100vw', height: '100vh' }}>
@@ -980,7 +848,7 @@ const ThreeWorkspace: React.FC = () => {
 
         <div style={{ marginBottom: '8px' }}>
           <div>Charges: {chargesState.length}</div>
-          <div>Sources: {sourceDefs.length}</div>
+          <div>Sources: {pointCharges.length}</div>
           <div style={{ fontSize: '10px', color: '#ccc' }}>
             Click charges to select, click empty space to add a voltage point
           </div>
@@ -1006,7 +874,7 @@ const ThreeWorkspace: React.FC = () => {
 
         <div style={{ marginBottom: '10px' }}>
           <button
-            onClick={addCharge}
+            onClick={addPointCharge}
             style={{
               padding: '8px 12px',
               background: '#4CAF50',
@@ -1021,7 +889,7 @@ const ThreeWorkspace: React.FC = () => {
             + Add Source
           </button>
 
-          {chargeStack.length > 0 && (
+          {objectStack.length > 0 && (
             <button
               onClick={removeLastAdded}
               style={{
@@ -1039,7 +907,7 @@ const ThreeWorkspace: React.FC = () => {
             </button>
           )}
 
-          {chargesState.length > 0 && (
+          {pointCharges.length > 0 && (
             <button
               onClick={removeAllCharges}
               style={{
@@ -1111,7 +979,7 @@ const ThreeWorkspace: React.FC = () => {
           Add Voltage Measurement (by coordinates)
         </button>
 
-        {selectedCharge && selectedSource && (
+        {selectedPointCharge && (
           <div
             style={{
               border: '1px solid #555',
@@ -1121,14 +989,14 @@ const ThreeWorkspace: React.FC = () => {
             }}
           >
             <div style={{ fontWeight: 'bold', marginBottom: '8px' }}>
-              Selected Charge: {selectedCharge.id}
+              Selected Charge: {selectedPointCharge.id}
             </div>
 
             <div style={{ marginBottom: '5px' }}>
               <label style={{ display: 'block', marginBottom: '2px' }}>Source Type:</label>
               <select
-                value={selectedSource.waveform.type}
-                onChange={(e) => updateSelectedSourceWaveform('type', e.target.value as SourceWaveformType)}
+                value={selectedPointCharge.waveform.type}
+                onChange={(e) => updatePointChargeWaveform(selectedPointCharge.id, 'type', e.target.value as SourceWaveformType)}
                 style={{
                   width: '100%',
                   padding: '4px',
@@ -1151,10 +1019,10 @@ const ThreeWorkspace: React.FC = () => {
               </label>
               <input
                 type="number"
-                value={(selectedCharge.magnitude * 1e6).toFixed(2)}
+                value={(selectedEvaluatedMagnitude * 1e6).toFixed(2)}
                 onChange={(e) => {
                   const newMagnitude = parseFloat(e.target.value) * 1e-6;
-                  updateChargeMagnitude(selectedCharge.id, newMagnitude);
+                  updatePointChargeWaveform(selectedPointCharge.id, 'offset', newMagnitude);
                 }}
                 style={{
                   width: '100%',
@@ -1168,7 +1036,7 @@ const ThreeWorkspace: React.FC = () => {
               />
             </div>
 
-            {selectedSource.waveform.type !== 'dc' && (
+            {selectedPointCharge.waveform.type !== 'dc' && (
               <>
                 <div style={{ marginBottom: '5px' }}>
                   <label style={{ display: 'block', marginBottom: '2px' }}>
@@ -1176,11 +1044,11 @@ const ThreeWorkspace: React.FC = () => {
                   </label>
                   <input
                     type="number"
-                    value={(selectedSource.waveform.amplitude * 1e6).toFixed(2)}
+                    value={(selectedPointCharge.waveform.amplitude * 1e6).toFixed(2)}
                     onChange={(e) => {
                       const v = parseFloat(e.target.value);
                       if (!Number.isNaN(v)) {
-                        updateSelectedSourceWaveform('amplitude', v * 1e-6);
+                        updatePointChargeWaveform(selectedPointCharge.id, 'amplitude', v * 1e-6);
                       }
                     }}
                     style={{
@@ -1201,11 +1069,11 @@ const ThreeWorkspace: React.FC = () => {
                   </label>
                   <input
                     type="number"
-                    value={selectedSource.waveform.frequencyHz}
+                    value={selectedPointCharge.waveform.frequencyHz}
                     onChange={(e) => {
                       const v = parseFloat(e.target.value);
                       if (!Number.isNaN(v)) {
-                        updateSelectedSourceWaveform('frequencyHz', Math.max(0.001, v));
+                        updatePointChargeWaveform(selectedPointCharge.id, 'frequencyHz', Math.max(0.001, v));
                       }
                     }}
                     style={{
@@ -1222,7 +1090,7 @@ const ThreeWorkspace: React.FC = () => {
               </>
             )}
 
-            {selectedSource.waveform.type === 'pulse' && (
+            {selectedPointCharge.waveform.type === 'pulse' && (
               <div style={{ marginBottom: '5px' }}>
                 <label style={{ display: 'block', marginBottom: '2px' }}>
                   Duty Cycle:
@@ -1232,9 +1100,9 @@ const ThreeWorkspace: React.FC = () => {
                   min={0.05}
                   max={0.95}
                   step={0.01}
-                  value={selectedSource.waveform.dutyCycle}
+                  value={selectedPointCharge.waveform.dutyCycle}
                   onChange={(e) => {
-                    updateSelectedSourceWaveform('dutyCycle', parseFloat(e.target.value));
+                    updatePointChargeWaveform(selectedPointCharge.id, 'dutyCycle', parseFloat(e.target.value));
                   }}
                   style={{ width: '100%' }}
                 />
@@ -1254,9 +1122,9 @@ const ThreeWorkspace: React.FC = () => {
                     setPositionInputs({ ...positionInputs, x: val });
                     const numVal = parseFloat(val);
                     if (!isNaN(numVal)) {
-                      const newPos = selectedCharge.position.clone();
+                      const newPos = selectedPointCharge.position.clone();
                       newPos.x = numVal;
-                      updateChargePosition(selectedCharge.id, newPos);
+                      updatePointChargePosition(selectedPointCharge.id, newPos);
                     }
                   }
                 }}
@@ -1285,9 +1153,9 @@ const ThreeWorkspace: React.FC = () => {
                     setPositionInputs({ ...positionInputs, y: val });
                     const numVal = parseFloat(val);
                     if (!isNaN(numVal)) {
-                      const newPos = selectedCharge.position.clone();
+                      const newPos = selectedPointCharge.position.clone();
                       newPos.y = numVal;
-                      updateChargePosition(selectedCharge.id, newPos);
+                      updatePointChargePosition(selectedPointCharge.id, newPos);
                     }
                   }
                 }}
@@ -1316,9 +1184,9 @@ const ThreeWorkspace: React.FC = () => {
                     setPositionInputs({ ...positionInputs, z: val });
                     const numVal = parseFloat(val);
                     if (!isNaN(numVal)) {
-                      const newPos = selectedCharge.position.clone();
+                      const newPos = selectedPointCharge.position.clone();
                       newPos.z = numVal;
-                      updateChargePosition(selectedCharge.id, newPos);
+                      updatePointChargePosition(selectedPointCharge.id, newPos);
                     }
                   }
                 }}
