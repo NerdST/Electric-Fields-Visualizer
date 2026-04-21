@@ -265,6 +265,7 @@ type FDTDSim = FDTDSimulationReader & {
   reset: () => void;
   addSource: (s: any) => void;
   clearSources: () => void;
+  clearSourceField: () => void;
   injectImpulse: (ix: number, iy: number, iz: number, amplitude: number) => void;
   getStepCount: () => number;
   getCurrentTime: () => number;
@@ -294,9 +295,9 @@ function worldToGrid(pos: THREE.Vector3): { ix: number; iy: number; iz: number }
 }
 
 /**
- * Inject all current charges as one-time impulses into the FDTD grid.
- * Resets the simulation first, then stamps each charge's field value
- * directly into the E field. Maxwell's equations propagate it from there.
+ * Reset the FDTD simulation and inject all charges into the persistent
+ * source field. Each charge continuously pumps energy into E each timestep
+ * (E += dt * source), creating expanding wavefronts — like Sangeeth's 2D version.
  */
 function injectChargesIntoFDTD(currentCharges: Charge[]) {
   fdtdSimulation.reset();
@@ -306,6 +307,7 @@ function injectChargesIntoFDTD(currentCharges: Charge[]) {
     const grid = worldToGrid(charge.position);
     if (!grid) continue;
 
+    // Inject into persistent source field — will pump E every step
     const amplitude = charge.magnitude > 0 ? 1.0 : -1.0;
     fdtdSimulation.injectImpulse(grid.ix, grid.iy, grid.iz, amplitude);
   }
