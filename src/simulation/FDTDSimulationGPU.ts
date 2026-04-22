@@ -1,48 +1,36 @@
 /**
  * GPU-accelerated 3D FDTD simulation using WebGPU compute shaders.
  *
- * Same physics as FDTDSimulation3D (CPU version) but runs all field updates
- * on the GPU in parallel. For a 32³ grid that's ~30K threads running
- * simultaneously instead of a sequential triple-nested loop.
+ * Same physics as FDTDSimulation3D (CPU) but massively parallel on GPU.
+ * Uses normalized units (μ=1, ε=1) matching Sangeeth's 2D implementation.
  *
  * Architecture:
- *   - 6 storage buffers on GPU: Ex, Ey, Ez, Hx, Hy, Hz
- *   - 4 compute pipelines: updateH, updateE, injectSource, applyBoundary
- *   - Each step() dispatches these pipelines in order
+ *   - 6 storage buffers: Ex, Ey, Ez, Hx, Hy, Hz
+ *   - 1 source field buffer: sourceEz (persistent charge field)
+ *   - 4 compute pipelines: injectSourceField, updateE, updateH, applyBoundary
  *   - readback() copies E fields to CPU for Three.js visualization
  */
 
-import type { FDTDConfig, FieldSource } from './FDTDSimulation3D';
+import type { FDTDConfig } from './FDTDSimulation3D';
 
-// Import shader source as strings (Vite handles ?raw imports)
 import updateHSource from '../shaders/updateH.wgsl?raw';
 import updateESource from '../shaders/updateE.wgsl?raw';
-import injectSourceSource from '../shaders/injectSource.wgsl?raw';
+import injectSourceFieldSource from '../shaders/injectSourceField.wgsl?raw';
 import applyBoundarySource from '../shaders/applyBoundary.wgsl?raw';
 
-const MU_0 = 4 * Math.PI * 1e-7;
-const EPSILON_0 = 8.854187817e-12;
-const C = 1 / Math.sqrt(MU_0 * EPSILON_0);
-
 export class FDTDSimulationGPU {
-  // Grid dimensions
   public readonly nx: number;
   public readonly ny: number;
   public readonly nz: number;
   private readonly totalCells: number;
 
-  // Physical parameters
   public readonly dx: number;
   public readonly dt: number;
-  private readonly chh: number;
-  private readonly che: number;
-  private readonly cee: number;
-  private readonly ceh: number;
+  private readonly beta: number;
 
-  // WebGPU resources
   private device: GPUDevice;
 
-  // Storage buffers for field components (live on GPU)
+  // Field buffers on GPU
   private exBuffer!: GPUBuffer;
   private eyBuffer!: GPUBuffer;
   private ezBuffer!: GPUBuffer;
@@ -50,37 +38,43 @@ export class FDTDSimulationGPU {
   private hyBuffer!: GPUBuffer;
   private hzBuffer!: GPUBuffer;
 
-  // Staging buffer for reading E fields back to CPU
+  // Source field (persistent charges)
+  private sourceEzBuffer!: GPUBuffer;
+
+  // Readback buffer
   private readbackBuffer!: GPUBuffer;
 
   // Uniform buffers
   private hParamsBuffer!: GPUBuffer;
   private eParamsBuffer!: GPUBuffer;
   private boundaryParamsBuffer!: GPUBuffer;
-  private sourceParamsBuffer!: GPUBuffer;
+  private sourceFieldParamsBuffer!: GPUBuffer;
 
-  // Compute pipelines
+  // Pipelines
   private updateHPipeline!: GPUComputePipeline;
   private updateEPipeline!: GPUComputePipeline;
-  private injectSourcePipeline!: GPUComputePipeline;
+  private injectSourceFieldPipeline!: GPUComputePipeline;
   private boundaryPipeline!: GPUComputePipeline;
 
   // Bind groups
   private updateHBindGroup!: GPUBindGroup;
   private updateEBindGroup!: GPUBindGroup;
+  private injectSourceFieldBindGroup!: GPUBindGroup;
   private boundaryBindGroup!: GPUBindGroup;
 
-  // Sources and state
-  private sources: FieldSource[] = [];
+  // State
+  private sources: any[] = [];
   private stepCount: number = 0;
   private currentTime: number = 0;
 
-  // CPU-side field copies (populated by readback)
+  // CPU-side copies (populated by readback)
   public Ex: Float32Array;
   public Ey: Float32Array;
   public Ez: Float32Array;
 
-  // Dispatch dimensions (workgroup count)
+  // CPU-side source field (written to GPU when charges change)
+  private sourceEzCPU: Float32Array;
+
   private dispatchX: number;
   private dispatchY: number;
   private dispatchZ: number;
@@ -92,28 +86,19 @@ export class FDTDSimulationGPU {
     this.nz = config.nz;
     this.totalCells = config.nx * config.ny * config.nz;
     this.dx = config.dx;
-    this.dt = config.courantNumber * config.dx / C;
+    this.dt = config.dt;
+    this.beta = config.dt / config.dx;
 
-    this.chh = 1.0;
-    this.che = this.dt / (MU_0 * this.dx);
-    this.cee = 1.0;
-    this.ceh = this.dt / (EPSILON_0 * this.dx);
-
-    // CPU-side copies for visualization readback
     this.Ex = new Float32Array(this.totalCells);
     this.Ey = new Float32Array(this.totalCells);
     this.Ez = new Float32Array(this.totalCells);
+    this.sourceEzCPU = new Float32Array(this.totalCells);
 
-    // Workgroup size is 4x4x4 = 64 threads per workgroup
     this.dispatchX = Math.ceil(this.nx / 4);
     this.dispatchY = Math.ceil(this.ny / 4);
     this.dispatchZ = Math.ceil(this.nz / 4);
   }
 
-  /**
-   * Async factory — WebGPU pipeline creation is async, so we can't do it
-   * in the constructor.
-   */
   static async create(device: GPUDevice, config: FDTDConfig): Promise<FDTDSimulationGPU> {
     const sim = new FDTDSimulationGPU(device, config);
     await sim.initGPUResources();
@@ -121,9 +106,8 @@ export class FDTDSimulationGPU {
   }
 
   private async initGPUResources(): Promise<void> {
-    const bufferSize = this.totalCells * 4; // 4 bytes per f32
+    const bufferSize = this.totalCells * 4;
 
-    // Create storage buffers for all 6 field components
     const createFieldBuffer = () => this.device.createBuffer({
       size: bufferSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -135,16 +119,16 @@ export class FDTDSimulationGPU {
     this.hxBuffer = createFieldBuffer();
     this.hyBuffer = createFieldBuffer();
     this.hzBuffer = createFieldBuffer();
+    this.sourceEzBuffer = createFieldBuffer();
 
-    // Readback buffer (3 fields * totalCells * 4 bytes) for copying E fields to CPU
     this.readbackBuffer = this.device.createBuffer({
       size: bufferSize * 3,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
 
-    // --- H update uniform: { nx, ny, nz, chh, che } ---
+    // H update params: { nx, ny, nz, chh(=1.0), che(=beta) }
     this.hParamsBuffer = this.device.createBuffer({
-      size: 32, // 3 u32 + 2 f32, padded to 32 bytes
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     const hParams = new ArrayBuffer(32);
@@ -152,11 +136,11 @@ export class FDTDSimulationGPU {
     hView.setUint32(0, this.nx, true);
     hView.setUint32(4, this.ny, true);
     hView.setUint32(8, this.nz, true);
-    hView.setFloat32(12, this.chh, true);
-    hView.setFloat32(16, this.che, true);
+    hView.setFloat32(12, 1.0, true);       // chh = 1.0 (lossless)
+    hView.setFloat32(16, this.beta, true); // che = beta = dt/dx
     this.device.queue.writeBuffer(this.hParamsBuffer, 0, hParams);
 
-    // --- E update uniform: { nx, ny, nz, cee, ceh } ---
+    // E update params: { nx, ny, nz, cee(=1.0), ceh(=beta) }
     this.eParamsBuffer = this.device.createBuffer({
       size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -166,11 +150,12 @@ export class FDTDSimulationGPU {
     eView.setUint32(0, this.nx, true);
     eView.setUint32(4, this.ny, true);
     eView.setUint32(8, this.nz, true);
-    eView.setFloat32(12, this.cee, true);
-    eView.setFloat32(16, this.ceh, true);
+    eView.setFloat32(12, 1.0, true);       // cee = 1.0
+    eView.setFloat32(16, this.beta, true); // ceh = beta = dt/dx
     this.device.queue.writeBuffer(this.eParamsBuffer, 0, eParams);
 
-    // --- Boundary uniform: { nx, ny, nz, _pad } ---
+    // Boundary params: { nx, ny, nz, spongeDepth }
+    const spongeDepth = Math.floor(Math.min(this.nx, this.ny, this.nz) / 4);
     this.boundaryParamsBuffer = this.device.createBuffer({
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -180,23 +165,29 @@ export class FDTDSimulationGPU {
     bView.setUint32(0, this.nx, true);
     bView.setUint32(4, this.ny, true);
     bView.setUint32(8, this.nz, true);
-    bView.setUint32(12, 0, true);
+    bView.setUint32(12, spongeDepth, true);
     this.device.queue.writeBuffer(this.boundaryParamsBuffer, 0, bParams);
 
-    // --- Source uniform buffer (updated each step) ---
-    this.sourceParamsBuffer = this.device.createBuffer({
-      size: 32, // { ix, iy, iz, polarization, value, nx, ny, _pad }
+    // Source field injection params: { nx, ny, nz, dt }
+    this.sourceFieldParamsBuffer = this.device.createBuffer({
+      size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+    const sfParams = new ArrayBuffer(16);
+    const sfView = new DataView(sfParams);
+    sfView.setUint32(0, this.nx, true);
+    sfView.setUint32(4, this.ny, true);
+    sfView.setUint32(8, this.nz, true);
+    sfView.setFloat32(12, this.dt, true);
+    this.device.queue.writeBuffer(this.sourceFieldParamsBuffer, 0, sfParams);
 
-    // --- Create compute pipelines ---
+    // Create pipelines
     this.updateHPipeline = await this.createPipeline(updateHSource);
     this.updateEPipeline = await this.createPipeline(updateESource);
-    this.injectSourcePipeline = await this.createPipeline(injectSourceSource);
+    this.injectSourceFieldPipeline = await this.createPipeline(injectSourceFieldSource);
     this.boundaryPipeline = await this.createPipeline(applyBoundarySource);
 
-    // --- Create bind groups ---
-    // H update: params, Ex(r), Ey(r), Ez(r), Hx(rw), Hy(rw), Hz(rw)
+    // Bind groups
     this.updateHBindGroup = this.device.createBindGroup({
       layout: this.updateHPipeline.getBindGroupLayout(0),
       entries: [
@@ -210,7 +201,6 @@ export class FDTDSimulationGPU {
       ],
     });
 
-    // E update: params, Hx(r), Hy(r), Hz(r), Ex(rw), Ey(rw), Ez(rw)
     this.updateEBindGroup = this.device.createBindGroup({
       layout: this.updateEPipeline.getBindGroupLayout(0),
       entries: [
@@ -224,7 +214,15 @@ export class FDTDSimulationGPU {
       ],
     });
 
-    // Boundary: params, Ex(rw), Ey(rw), Ez(rw)
+    this.injectSourceFieldBindGroup = this.device.createBindGroup({
+      layout: this.injectSourceFieldPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.sourceFieldParamsBuffer } },
+        { binding: 1, resource: { buffer: this.sourceEzBuffer } },
+        { binding: 2, resource: { buffer: this.ezBuffer } },
+      ],
+    });
+
     this.boundaryBindGroup = this.device.createBindGroup({
       layout: this.boundaryPipeline.getBindGroupLayout(0),
       entries: [
@@ -232,6 +230,9 @@ export class FDTDSimulationGPU {
         { binding: 1, resource: { buffer: this.exBuffer } },
         { binding: 2, resource: { buffer: this.eyBuffer } },
         { binding: 3, resource: { buffer: this.ezBuffer } },
+        { binding: 4, resource: { buffer: this.hxBuffer } },
+        { binding: 5, resource: { buffer: this.hyBuffer } },
+        { binding: 6, resource: { buffer: this.hzBuffer } },
       ],
     });
   }
@@ -244,94 +245,62 @@ export class FDTDSimulationGPU {
     });
   }
 
-  /** Add an oscillating source */
-  public addSource(source: FieldSource): void {
-    this.sources.push(source);
-  }
-
-  /** Remove all sources */
-  public clearSources(): void {
-    this.sources = [];
-  }
-
-  public getStepCount(): number {
-    return this.stepCount;
-  }
-
-  public getCurrentTime(): number {
-    return this.currentTime;
-  }
+  // Legacy API compatibility
+  public addSource(source: any): void { this.sources.push(source); }
+  public clearSources(): void { this.sources = []; }
 
   /**
-   * Run one FDTD timestep entirely on the GPU.
-   *
-   * Dispatches: updateH → updateE → injectSources → applyBoundary
-   * All in a single command buffer submitted to the GPU queue.
+   * Inject a charge into the persistent source field.
+   * Writes to CPU array, then uploads to GPU.
+   */
+  public injectImpulse(ix: number, iy: number, iz: number, amplitude: number): void {
+    const idx = ix + iy * this.nx + iz * this.nx * this.ny;
+    this.sourceEzCPU[idx] += amplitude;
+    // Upload to GPU
+    this.device.queue.writeBuffer(this.sourceEzBuffer, 0, this.sourceEzCPU.buffer);
+  }
+
+  /** Clear the source field */
+  public clearSourceField(): void {
+    this.sourceEzCPU.fill(0);
+    this.device.queue.writeBuffer(this.sourceEzBuffer, 0, this.sourceEzCPU.buffer);
+  }
+
+  public getStepCount(): number { return this.stepCount; }
+  public getCurrentTime(): number { return this.currentTime; }
+
+  /**
+   * One FDTD timestep on GPU:
+   *   1. Inject source field: Ez += dt * sourceEz
+   *   2. Update E from curl(H)
+   *   3. Update H from curl(E)
+   *   4. Apply absorbing boundary
    */
   public step(): void {
     const encoder = this.device.createCommandEncoder();
 
-    // 1. Update H fields
-    const hPass = encoder.beginComputePass();
-    hPass.setPipeline(this.updateHPipeline);
-    hPass.setBindGroup(0, this.updateHBindGroup);
-    hPass.dispatchWorkgroups(this.dispatchX, this.dispatchY, this.dispatchZ);
-    hPass.end();
+    // 1. Inject source field
+    const sfPass = encoder.beginComputePass();
+    sfPass.setPipeline(this.injectSourceFieldPipeline);
+    sfPass.setBindGroup(0, this.injectSourceFieldBindGroup);
+    sfPass.dispatchWorkgroups(this.dispatchX, this.dispatchY, this.dispatchZ);
+    sfPass.end();
 
-    // 2. Update E fields
+    // 2. Update E
     const ePass = encoder.beginComputePass();
     ePass.setPipeline(this.updateEPipeline);
     ePass.setBindGroup(0, this.updateEBindGroup);
     ePass.dispatchWorkgroups(this.dispatchX, this.dispatchY, this.dispatchZ);
     ePass.end();
 
-    // 3. Inject sources (one dispatch per source)
-    for (const source of this.sources) {
-      let value: number;
-      if (source.type === 'pulse') {
-        const sigma = source.pulseWidth ?? (3 / source.frequency);
-        const t0 = 3 * sigma;
-        const t = this.currentTime;
-        const envelope = Math.exp(-((t - t0) * (t - t0)) / (2 * sigma * sigma));
-        value = source.amplitude * envelope * Math.sin(2 * Math.PI * source.frequency * t);
-      } else {
-        value = source.amplitude * Math.sin(
-          2 * Math.PI * source.frequency * this.currentTime
-        );
-      }
+    // 3. Update H
+    const hPass = encoder.beginComputePass();
+    hPass.setPipeline(this.updateHPipeline);
+    hPass.setBindGroup(0, this.updateHBindGroup);
+    hPass.dispatchWorkgroups(this.dispatchX, this.dispatchY, this.dispatchZ);
+    hPass.end();
 
-      // Write source params to GPU
-      const sParams = new ArrayBuffer(32);
-      const sView = new DataView(sParams);
-      sView.setUint32(0, source.ix, true);
-      sView.setUint32(4, source.iy, true);
-      sView.setUint32(8, source.iz, true);
-      sView.setUint32(12, source.polarization === 'x' ? 0 : source.polarization === 'y' ? 1 : 2, true);
-      sView.setFloat32(16, value, true);
-      sView.setUint32(20, this.nx, true);
-      sView.setUint32(24, this.ny, true);
-      sView.setUint32(28, 0, true); // padding
-      this.device.queue.writeBuffer(this.sourceParamsBuffer, 0, sParams);
-
-      // Create bind group for this source dispatch
-      const sourceBindGroup = this.device.createBindGroup({
-        layout: this.injectSourcePipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.sourceParamsBuffer } },
-          { binding: 1, resource: { buffer: this.exBuffer } },
-          { binding: 2, resource: { buffer: this.eyBuffer } },
-          { binding: 3, resource: { buffer: this.ezBuffer } },
-        ],
-      });
-
-      const sPass = encoder.beginComputePass();
-      sPass.setPipeline(this.injectSourcePipeline);
-      sPass.setBindGroup(0, sourceBindGroup);
-      sPass.dispatchWorkgroups(1); // Only one thread needed
-      sPass.end();
-    }
-
-    // 4. Apply boundary conditions
+    // 4. Apply boundary
     const bPass = encoder.beginComputePass();
     bPass.setPipeline(this.boundaryPipeline);
     bPass.setBindGroup(0, this.boundaryBindGroup);
@@ -344,13 +313,7 @@ export class FDTDSimulationGPU {
     this.currentTime += this.dt;
   }
 
-  /**
-   * Copy E field data from GPU back to CPU Float32Arrays.
-   * The FDTDVectorFieldRenderer reads from these arrays.
-   *
-   * This is async because GPU→CPU readback requires mapping the buffer.
-   * Call this once per frame (not once per step).
-   */
+  /** Copy E fields from GPU to CPU for visualization */
   public async readback(): Promise<void> {
     const bufferSize = this.totalCells * 4;
 
@@ -368,23 +331,25 @@ export class FDTDSimulationGPU {
     this.readbackBuffer.unmap();
   }
 
-  /** Reset all fields to zero */
+  /** Reset all fields and source field */
   public reset(): void {
     const zeros = new Float32Array(this.totalCells);
-    this.device.queue.writeBuffer(this.exBuffer, 0, zeros);
-    this.device.queue.writeBuffer(this.eyBuffer, 0, zeros);
-    this.device.queue.writeBuffer(this.ezBuffer, 0, zeros);
-    this.device.queue.writeBuffer(this.hxBuffer, 0, zeros);
-    this.device.queue.writeBuffer(this.hyBuffer, 0, zeros);
-    this.device.queue.writeBuffer(this.hzBuffer, 0, zeros);
+    const buf = zeros.buffer as ArrayBuffer;
+    this.device.queue.writeBuffer(this.exBuffer, 0, buf);
+    this.device.queue.writeBuffer(this.eyBuffer, 0, buf);
+    this.device.queue.writeBuffer(this.ezBuffer, 0, buf);
+    this.device.queue.writeBuffer(this.hxBuffer, 0, buf);
+    this.device.queue.writeBuffer(this.hyBuffer, 0, buf);
+    this.device.queue.writeBuffer(this.hzBuffer, 0, buf);
+    this.device.queue.writeBuffer(this.sourceEzBuffer, 0, buf);
     this.Ex.fill(0);
     this.Ey.fill(0);
     this.Ez.fill(0);
+    this.sourceEzCPU.fill(0);
     this.stepCount = 0;
     this.currentTime = 0;
   }
 
-  /** Helper methods for compatibility with the vector field renderer */
   public idx(i: number, j: number, k: number): number {
     return i + j * this.nx + k * this.nx * this.ny;
   }
@@ -402,7 +367,6 @@ export class FDTDSimulationGPU {
     return [this.Ex[id], this.Ey[id], this.Ez[id]];
   }
 
-  /** Clean up GPU resources */
   public destroy(): void {
     this.exBuffer.destroy();
     this.eyBuffer.destroy();
@@ -410,10 +374,11 @@ export class FDTDSimulationGPU {
     this.hxBuffer.destroy();
     this.hyBuffer.destroy();
     this.hzBuffer.destroy();
+    this.sourceEzBuffer.destroy();
     this.readbackBuffer.destroy();
     this.hParamsBuffer.destroy();
     this.eParamsBuffer.destroy();
     this.boundaryParamsBuffer.destroy();
-    this.sourceParamsBuffer.destroy();
+    this.sourceFieldParamsBuffer.destroy();
   }
 }

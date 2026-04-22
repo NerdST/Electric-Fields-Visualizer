@@ -36,9 +36,9 @@ export interface FieldSource {
 
 export function createDefaultFDTDConfig(): FDTDConfig {
   return {
-    nx: 32,
-    ny: 32,
-    nz: 32,
+    nx: 96,
+    ny: 96,
+    nz: 96,
     dx: 0.01,     // cell size (normalized)
     dt: 0.001,    // time step (normalized, same as Sangeeth's 2D)
   };
@@ -235,14 +235,14 @@ export class FDTDSimulation3D {
   }
 
   /**
-   * Absorbing sponge boundary — damps fields near grid edges
-   * so waves fade out instead of reflecting.
+   * Absorbing sponge boundary — aggressively damps fields near grid edges.
+   * Uses a thick layer with strong quadratic damping so waves are
+   * essentially dead before they can reflect.
    */
-  private readonly spongeDepth = 6;
-
   private applyBoundaryConditions(): void {
     const { nx, ny, nz } = this;
-    const depth = Math.min(this.spongeDepth, Math.floor(Math.min(nx, ny, nz) / 4));
+    // Use ~25% of grid as sponge on each side — aggressive absorption
+    const depth = Math.floor(Math.min(nx, ny, nz) / 4);
 
     for (let k = 0; k < nz; k++) {
       for (let j = 0; j < ny; j++) {
@@ -254,8 +254,10 @@ export class FDTDSimulation3D {
 
           if (d <= 0) continue;
 
+          // Strong cubic damping: at boundary edge (t=1), decay ≈ 0.05
+          // Energy drops to ~0.05^8 ≈ 0 across the sponge layer
           const t = d / depth;
-          const decay = 1.0 - t * t * 0.4;
+          const decay = 1.0 - t * t * t * 0.95;
 
           const idx = this.idx(i, j, k);
           this.Ex[idx] *= decay;

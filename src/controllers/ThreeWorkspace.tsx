@@ -277,7 +277,7 @@ let fdtdIsGPU = false;
 
 /** Convert a world-space position to FDTD grid indices */
 function worldToGrid(pos: THREE.Vector3): { ix: number; iy: number; iz: number } | null {
-  const ws = 0.3; // worldScale used by heatmap
+  const ws = fdtdIsGPU ? 0.15 : 0.3; // worldScale used by heatmap
   const ox = -(fdtdConfig.nx * ws) / 2;
   const oy = -(fdtdConfig.ny * ws) / 2;
   const oz = -(fdtdConfig.nz * ws) / 2;
@@ -313,9 +313,38 @@ function injectChargesIntoFDTD(currentCharges: Charge[]) {
   }
 }
 
-// GPU disabled for now — using CPU to debug visualization
-// TODO: re-enable GPU once heatmap is confirmed working
-console.log('FDTD: using CPU simulation');
+// Try to initialize GPU simulation — fall back to CPU if unavailable
+(async () => {
+  if (!('gpu' in navigator)) {
+    console.log('FDTD: WebGPU not available, using CPU simulation');
+    return;
+  }
+  try {
+    const adapter = await (navigator as any).gpu.requestAdapter();
+    if (!adapter) {
+      console.log('FDTD: No GPU adapter, using CPU simulation');
+      return;
+    }
+    const device: GPUDevice = await adapter.requestDevice();
+    const gpuSim = await FDTDSimulationGPU.create(device, fdtdConfig);
+
+    // Swap in GPU simulation
+    fdtdSimulation = gpuSim as unknown as FDTDSim;
+    fdtdIsGPU = true;
+
+    // Rebuild heatmap with the new simulation reference
+    fdtdHeatmap.dispose();
+    fdtdHeatmap = new FDTDHeatmapRenderer(scene, fdtdSimulation, 0.15, 3);
+    fdtdHeatmap.setVisible(true);
+
+    // Re-inject charges into the new GPU simulation
+    injectChargesIntoFDTD(charges);
+
+    console.log(`FDTD: GPU simulation active (${fdtdConfig.nx}³ grid)`);
+  } catch (err) {
+    console.warn('FDTD: GPU init failed, using CPU simulation', err);
+  }
+})();
 
 // FDTD is always running — it's the core physics engine
 let fdtdRunning = true;
